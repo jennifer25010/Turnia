@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Turnia
 
 Fundación técnica de Turnia: monorepo con React, Vite y TypeScript en el frontend; Express y TypeScript en la API; PostgreSQL, Prisma, Tailwind CSS y Vitest.
@@ -68,3 +69,6 @@ Si `docker version` no conecta con el daemon, inicia Docker Desktop. Si `docker 
 
 - [Arquitectura](docs/architecture.md)
 - [Plan de implementación](docs/implementation-plan.md)
+=======
+# turnia
+>>>>>>> ceb93a00758fde93f2d81949dc98baa013b7559b
