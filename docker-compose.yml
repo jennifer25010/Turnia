@@ -18,5 +18,3 @@
 
 volumes:
   turnia-postgres-data:
-
-

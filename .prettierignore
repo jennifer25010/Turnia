@@ -1,0 +1,8 @@
+﻿pnpm-lock.yaml
+**/*.backup.*
+**/App.backup.tsx
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/

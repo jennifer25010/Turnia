@@ -27,6 +27,19 @@ enum BookingSource {
   PANEL
 }
 
+enum BookingEventType {
+  CREATED
+  MODIFIED
+  CANCELLED
+  STATUS_CHANGED
+}
+
+enum BookingActorType {
+  USER
+  CUSTOMER
+  SYSTEM
+}
+
 enum UserTokenPurpose {
   EMAIL_VERIFICATION
   PASSWORD_RESET
@@ -43,27 +56,33 @@ model User {
   createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
 
-  memberships      Membership[]
-  sessions         Session[]
-  tokens           UserToken[]
-  customerProfiles Customer[]   @relation("CustomerUser")
-  staffProfiles    Staff[]      @relation("StaffUser")
-  bookingsCreated  Booking[]    @relation("BookingCreator")
+  memberships       Membership[]
+  sessions          Session[]
+  tokens            UserToken[]
+  customerProfiles  Customer[]     @relation("CustomerUser")
+  staffProfiles     Staff[]        @relation("StaffUser")
+  bookingsCreated   Booking[]      @relation("BookingCreator")
+  bookingsCancelled Booking[]      @relation("BookingCanceller")
+  bookingEvents     BookingEvent[] @relation("BookingEventActor")
 }
 
 model Business {
-  id                 String   @id @default(uuid()) @db.Uuid
-  name               String
-  slug               String   @unique
-  description        String?
-  timezone           String   @default("America/Bogota")
-  currency           String   @default("COP") @db.VarChar(3)
-  bookingHoldMinutes Int      @default(1440)
-  email              String?
-  phone              String?
-  active             Boolean  @default(true)
-  createdAt          DateTime @default(now()) @db.Timestamptz(3)
-  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+  id                        String   @id @default(uuid()) @db.Uuid
+  name                      String
+  slug                      String   @unique
+  description               String?
+  timezone                  String   @default("America/Bogota")
+  currency                  String   @default("COP") @db.VarChar(3)
+  bookingHoldMinutes        Int      @default(1440)
+  // Aviso mínimo (en minutos antes del inicio) para cancelar o modificar una
+  // reserva. 0 = sin restricción. OWNER/ADMIN pueden omitirlo con motivo.
+  cancellationNoticeMinutes Int      @default(0)
+  rescheduleNoticeMinutes   Int      @default(0)
+  email                     String?
+  phone                     String?
+  active                    Boolean  @default(true)
+  createdAt                 DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt                 DateTime @updatedAt @db.Timestamptz(3)
 
   memberships   Membership[]
   services      Service[]
@@ -245,19 +264,54 @@ model Booking {
   confirmedAt DateTime? @db.Timestamptz(3)
   cancelledAt DateTime? @db.Timestamptz(3)
 
+  // Control de concurrencia optimista: cada cambio incrementa la versión y las
+  // operaciones exigen la versión que el usuario vio.
+  version           Int     @default(1)
+  cancelReason      String?
+  cancelledByUserId String? @db.Uuid
+
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  business  Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
-  customer  Customer @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
-  service   Service  @relation(fields: [serviceId, businessId], references: [id, businessId], onDelete: Restrict)
-  staff     Staff    @relation(fields: [staffId, businessId], references: [id, businessId], onDelete: Restrict)
-  createdBy User?    @relation("BookingCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  business    Business       @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer    Customer       @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  service     Service        @relation(fields: [serviceId, businessId], references: [id, businessId], onDelete: Restrict)
+  staff       Staff          @relation(fields: [staffId, businessId], references: [id, businessId], onDelete: Restrict)
+  createdBy   User?          @relation("BookingCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  cancelledBy User?          @relation("BookingCanceller", fields: [cancelledByUserId], references: [id], onDelete: Restrict)
+  events      BookingEvent[]
 
+  @@unique([id, businessId])
   @@index([businessId, startsAt])
   @@index([staffId, startsAt])
   @@index([customerId, createdAt])
   @@index([businessId, status, startsAt])
+}
+
+// Historial de auditoría de reservas. Solo se inserta; nunca se actualiza ni se
+// borra desde la aplicación. Las reservas anteriores a la Etapa 2 no tienen
+// eventos (no se rellenan datos históricos que no existen).
+model BookingEvent {
+  id          String           @id @default(uuid()) @db.Uuid
+  businessId  String           @db.Uuid
+  bookingId   String           @db.Uuid
+  type        BookingEventType
+  actorType   BookingActorType @default(USER)
+  actorUserId String?          @db.Uuid
+  fromStatus  BookingStatus?
+  toStatus    BookingStatus?
+  reason      String?
+  // Valores antes/después y, si aplica, la restricción omitida por un
+  // OWNER/ADMIN (restricción, aviso exigido y aviso real).
+  data        Json?
+  createdAt   DateTime         @default(now()) @db.Timestamptz(3)
+
+  booking   Booking @relation(fields: [bookingId, businessId], references: [id, businessId], onDelete: Restrict)
+  actorUser User?   @relation("BookingEventActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([bookingId, createdAt])
+  @@index([businessId, createdAt])
+  @@index([actorUserId])
 }
 
 model Session {

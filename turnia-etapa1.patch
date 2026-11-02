@@ -1,0 +1,3278 @@
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/README.md ./README.md
+--- ../turnia-original/README.md	2026-10-31 20:41:48.708368017 +0000
++++ ./README.md	2026-10-31 20:52:09.994624307 +0000
+@@ -1,5 +1,3 @@
+-<<<<<<< HEAD
+-
+ # Turnia
+ 
+ Fundación técnica de Turnia: monorepo con React, Vite y TypeScript en el frontend; Express y TypeScript en la API; PostgreSQL, Prisma, Tailwind CSS y Vitest.
+@@ -46,7 +44,11 @@
+ 
+ ## Prisma
+ 
+-El esquema PostgreSQL inicial está en `prisma/schema.prisma` y no contiene modelos de negocio. Tras crear `.env`, ejecuta `pnpm prisma:validate` para validar el esquema y `pnpm prisma:generate` para generar Prisma Client. Validar o generar no requiere que PostgreSQL esté levantado; conectar la aplicación sí.
++El esquema PostgreSQL está en `prisma/schema.prisma` y las migraciones en `prisma/migrations`. Tras crear `.env`, ejecuta `pnpm prisma:validate` para validar el esquema y `pnpm prisma:generate` para generar Prisma Client. Validar o generar no requiere que PostgreSQL esté levantado; conectar la aplicación sí.
++
++Las restricciones de integridad de la agenda (exclusión de reservas solapadas por empleado y comprobaciones de rangos) viven en migraciones SQL; consulta [docs/etapa-1-agenda-segura.md](docs/etapa-1-agenda-segura.md).
++
++Datos de demostración (negocio, servicio, empleado y horarios por defecto): `pnpm db:seed`. Para crear además un usuario propietario, define `SEED_OWNER_EMAIL`, `SEED_OWNER_PASSWORD` (mínimo 12 caracteres) y `SEED_OWNER_NAME` en `.env` antes de ejecutarlo.
+ 
+ ## Verificar en Windows
+ 
+@@ -70,8 +72,4 @@
+ 
+ - [Arquitectura](docs/architecture.md)
+ - [Plan de implementación](docs/implementation-plan.md)
+-  \=======
+-
+-# turnia
+-
+-> > > > > > > ceb93a00758fde93f2d81949dc98baa013b7559b
++- [Etapa 1: agenda segura y acceso](docs/etapa-1-agenda-segura.md)
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/app.test.ts ./apps/api/src/app.test.ts
+--- ../turnia-original/apps/api/src/app.test.ts	2026-10-31 20:41:48.706479973 +0000
++++ ./apps/api/src/app.test.ts	2026-10-31 20:48:55.213092495 +0000
+@@ -1,14 +1,16 @@
+ import express from "express";
+ import request from "supertest";
+ 
+-import { beforeEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import { hashSessionToken } from "./auth.js";
+ 
+ const { prismaMock } = vi.hoisted(() => ({
+   prismaMock: {
+     $queryRaw: vi.fn(),
+     $transaction: vi.fn(),
+-    session: { findFirst: vi.fn() },
+-    membership: { findFirst: vi.fn() },
++    session: { findFirst: vi.fn() },
++    membership: { findFirst: vi.fn() },
+     booking: {
+       findMany: vi.fn(),
+       create: vi.fn(),
+@@ -25,6 +27,10 @@
+     staffService: {
+       findUnique: vi.fn(),
+     },
++    businessHours: { findMany: vi.fn() },
++    staffAvailability: { findMany: vi.fn() },
++    businessClosure: { findMany: vi.fn() },
++    timeOff: { findMany: vi.fn() },
+     customer: {
+       findFirst: vi.fn(),
+       create: vi.fn(),
+@@ -245,25 +251,72 @@
+     expect(prismaMock.booking.findMany).not.toHaveBeenCalled();
+   });
+ });
+-
+ 
+-describe("POST /api/v1/bookings: creación simulada", () => {
++const BUSINESS_ID = "758ad131-14b1-42e4-8d74-d093bb62c41b";
++const SERVICE_ID = "caa733de-3c1a-4679-b2ea-5d9a79e792cb";
++const STAFF_ID = "cd5e9781-0edf-45e0-9e4f-3a32aef9b681";
++const SESSION_TOKEN = "b".repeat(43);
++
++// Lunes 2026-10-26, 10:00 en Bogotá (UTC-5) = 15:00 UTC.
++const MONDAY_10AM = "2026-10-26T10:00:00-05:00";
++const MONDAY_10AM_UTC = new Date("2026-10-26T15:00:00.000Z");
++const MONDAY_1030AM_UTC = new Date("2026-10-26T15:30:00.000Z");
++
++const bookingPayload = (overrides: Record<string, unknown> = {}) => ({
++  businessId: BUSINESS_ID,
++  serviceId: SERVICE_ID,
++  staffId: STAFF_ID,
++  startsAt: MONDAY_10AM,
++  name: "Cliente de prueba",
++  email: "cliente@example.com",
++  phone: "3001234567",
++  ...overrides,
++});
++
++function mockAuthorizedPanelUser() {
++  prismaMock.session.findFirst.mockResolvedValue({
++    user: { id: "user-1", active: true },
++  });
++  prismaMock.membership.findFirst.mockResolvedValue({ id: "membership-1" });
++}
++
++function mockBusinessSchedule() {
++  // Lunes (1) a sábado (6), 08:00 a 18:00.
++  const windows = [1, 2, 3, 4, 5, 6].map((weekday) => ({
++    weekday,
++    startMinute: 8 * 60,
++    endMinute: 18 * 60,
++  }));
++  prismaMock.businessHours.findMany.mockResolvedValue(windows);
++  prismaMock.staffAvailability.findMany.mockResolvedValue(windows);
++  prismaMock.businessClosure.findMany.mockResolvedValue([]);
++  prismaMock.timeOff.findMany.mockResolvedValue([]);
++}
++
++describe("POST /api/v1/bookings: autorización, agenda y creación", () => {
+   beforeEach(() => {
+-    vi.clearAllMocks();
++    vi.resetAllMocks();
++    // Solo se simula Date; los temporizadores reales siguen funcionando.
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(new Date("2026-10-20T12:00:00.000Z"));
+ 
+     prismaMock.$transaction.mockImplementation(
+       async (callback: (tx: typeof prismaMock) => Promise<unknown>) =>
+         callback(prismaMock),
+     );
+ 
++    mockAuthorizedPanelUser();
++    mockBusinessSchedule();
++
+     prismaMock.business.findFirst.mockResolvedValue({
+-      id: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++      id: BUSINESS_ID,
+       bookingHoldMinutes: 1440,
++      timezone: "America/Bogota",
+     });
+ 
+     prismaMock.service.findFirst.mockResolvedValue({
+-      id: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++      id: SERVICE_ID,
++      businessId: BUSINESS_ID,
+       name: "Corte de cabello",
+       durationMinutes: 30,
+       price: 25000,
+@@ -271,20 +324,19 @@
+     });
+ 
+     prismaMock.staff.findFirst.mockResolvedValue({
+-      id: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++      id: STAFF_ID,
++      businessId: BUSINESS_ID,
+       displayName: "Empleado Demo",
+       active: true,
+     });
+ 
+     prismaMock.staffService.findUnique.mockResolvedValue({
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+-      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+-      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
++      businessId: BUSINESS_ID,
++      staffId: STAFF_ID,
++      serviceId: SERVICE_ID,
+     });
+ 
+     prismaMock.customer.findFirst.mockResolvedValue(null);
+-
+     prismaMock.customer.create.mockResolvedValue({
+       id: "customer-simulado",
+       name: "Cliente de prueba",
+@@ -294,22 +346,58 @@
+ 
+     prismaMock.booking.create.mockResolvedValue({
+       id: "booking-simulado",
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++      businessId: BUSINESS_ID,
+       customerId: "customer-simulado",
+-      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+-      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
++      serviceId: SERVICE_ID,
++      staffId: STAFF_ID,
+       status: "CONFIRMED",
+       customerNameSnapshot: "Cliente de prueba",
+       serviceNameSnapshot: "Corte de cabello",
+       durationMinutesSnapshot: 30,
+       priceSnapshot: 25000,
+-      startsAt: new Date("2026-10-25T15:00:00.000Z"),
+-      endsAt: new Date("2026-10-25T15:30:00.000Z"),
++      startsAt: MONDAY_10AM_UTC,
++      endsAt: MONDAY_1030AM_UTC,
+       notes: null,
+       createdAt: new Date("2026-10-20T12:00:00.000Z"),
+     });
+   });
+ 
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  const post = (body: Record<string, unknown> = bookingPayload()) =>
++    request(app)
++      .post("/api/v1/bookings")
++      .set("Cookie", `turnia_session=${SESSION_TOKEN}`)
++      .send(body);
++
++  it("rechaza crear una reserva sin sesión y no toca la base de datos", async () => {
++    const response = await request(app)
++      .post("/api/v1/bookings")
++      .send(bookingPayload());
++
++    expect(response.status).toBe(401);
++    expect(response.body.error.code).toBe("UNAUTHENTICATED");
++    expect(prismaMock.$transaction).not.toHaveBeenCalled();
++    expect(prismaMock.booking.create).not.toHaveBeenCalled();
++  });
++
++  it("rechaza crear una reserva si el usuario no pertenece al negocio", async () => {
++    prismaMock.membership.findFirst.mockResolvedValue(null);
++
++    const response = await post();
++
++    expect(response.status).toBe(403);
++    expect(response.body.error.code).toBe("FORBIDDEN");
++    expect(prismaMock.membership.findFirst).toHaveBeenCalledWith({
++      where: { businessId: BUSINESS_ID, userId: "user-1" },
++      select: { id: true },
++    });
++    expect(prismaMock.$transaction).not.toHaveBeenCalled();
++    expect(prismaMock.booking.create).not.toHaveBeenCalled();
++  });
++
+   it("rechaza una reserva cuando existe un conflicto de horario", async () => {
+     prismaMock.$transaction.mockRejectedValue(
+       Object.assign(
+@@ -320,31 +408,15 @@
+       ),
+     );
+ 
+-    const response = await request(app).post("/api/v1/bookings").send({
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+-      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+-      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+-      startsAt: "2026-10-25T10:00:00-05:00",
+-      name: "Cliente de prueba",
+-      email: "cliente@example.com",
+-      phone: "3001234567",
+-    });
++    const response = await post();
+ 
+     expect(response.status).toBe(409);
+     expect(response.body.error.code).toBe("BOOKING_CONFLICT");
+     expect(response.body.error.message).toContain("horario");
+   });
+ 
+-  it("crea una reserva y calcula su hora de finalización", async () => {
+-    const response = await request(app).post("/api/v1/bookings").send({
+-      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+-      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+-      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+-      startsAt: "2026-10-25T10:00:00-05:00",
+-      name: "Cliente de prueba",
+-      email: "cliente@example.com",
+-      phone: "3001234567",
+-    });
++  it("crea una reserva, calcula su fin y registra quién la creó", async () => {
++    const response = await post();
+ 
+     expect(response.status).toBe(201);
+     expect(response.body.data.id).toBe("booking-simulado");
+@@ -354,12 +426,173 @@
+       expect.objectContaining({
+         data: expect.objectContaining({
+           status: "CONFIRMED",
++          createdByUserId: "user-1",
+           durationMinutesSnapshot: 30,
+           priceSnapshot: 25000,
+-          startsAt: new Date("2026-10-25T15:00:00.000Z"),
+-          endsAt: new Date("2026-10-25T15:30:00.000Z"),
++          startsAt: MONDAY_10AM_UTC,
++          endsAt: MONDAY_1030AM_UTC,
++        }),
++      }),
++    );
++  });
++
++  it("rechaza una hora fuera del horario del negocio (422)", async () => {
++    const response = await post(
++      bookingPayload({ startsAt: "2026-10-26T19:00:00-05:00" }),
++    );
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.code).toBe("SLOT_UNAVAILABLE");
++    expect(response.body.error.details.reason).toBe("OUTSIDE_BUSINESS_HOURS");
++    expect(prismaMock.booking.create).not.toHaveBeenCalled();
++  });
++
++  it("rechaza un domingo cuando el negocio no atiende ese día", async () => {
++    const response = await post(
++      bookingPayload({ startsAt: "2026-10-25T10:00:00-05:00" }),
++    );
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.details.reason).toBe("OUTSIDE_BUSINESS_HOURS");
++    expect(prismaMock.booking.create).not.toHaveBeenCalled();
++  });
++
++  it("rechaza un horario que ya pasó", async () => {
++    const response = await post(
++      bookingPayload({ startsAt: "2026-10-19T10:00:00-05:00" }),
++    );
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.details.reason).toBe("PAST");
++    expect(prismaMock.booking.create).not.toHaveBeenCalled();
++  });
++
++  it("rechaza una hora cuando el empleado no trabaja en ese horario", async () => {
++    prismaMock.staffAvailability.findMany.mockResolvedValue([
++      { weekday: 1, startMinute: 13 * 60, endMinute: 18 * 60 },
++    ]);
++
++    const response = await post();
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.details.reason).toBe(
++      "OUTSIDE_STAFF_AVAILABILITY",
++    );
++  });
++
++  it("rechaza una hora durante una ausencia del empleado", async () => {
++    prismaMock.timeOff.findMany.mockResolvedValue([
++      {
++        startsAt: new Date("2026-10-26T14:00:00.000Z"),
++        endsAt: new Date("2026-10-26T16:00:00.000Z"),
++      },
++    ]);
++
++    const response = await post();
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.details.reason).toBe("STAFF_TIME_OFF");
++  });
++
++  it("rechaza una hora durante un cierre del negocio", async () => {
++    prismaMock.businessClosure.findMany.mockResolvedValue([
++      {
++        startsAt: new Date("2026-10-26T05:00:00.000Z"),
++        endsAt: new Date("2026-10-27T05:00:00.000Z"),
++      },
++    ]);
++
++    const response = await post();
++
++    expect(response.status).toBe(422);
++    expect(response.body.error.details.reason).toBe("BUSINESS_CLOSED");
++  });
++});
++
++describe("GET /api/v1/availability", () => {
++  beforeEach(() => {
++    vi.resetAllMocks();
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(new Date("2026-10-20T12:00:00.000Z"));
++
++    mockBusinessSchedule();
++    prismaMock.business.findFirst.mockResolvedValue({
++      id: BUSINESS_ID,
++      timezone: "America/Bogota",
++    });
++    prismaMock.service.findFirst.mockResolvedValue({
++      id: SERVICE_ID,
++      durationMinutes: 30,
++    });
++    prismaMock.staff.findFirst.mockResolvedValue({ id: STAFF_ID });
++    prismaMock.staffService.findUnique.mockResolvedValue({
++      businessId: BUSINESS_ID,
++      staffId: STAFF_ID,
++      serviceId: SERVICE_ID,
++    });
++    prismaMock.booking.findMany.mockResolvedValue([]);
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  const query = (date = "2026-10-26") =>
++    `/api/v1/availability?businessId=${BUSINESS_ID}&serviceId=${SERVICE_ID}&staffId=${STAFF_ID}&date=${date}`;
++
++  it("rechaza parámetros inválidos sin consultar la base de datos", async () => {
++    const response = await request(app).get(
++      `/api/v1/availability?businessId=${BUSINESS_ID}&serviceId=${SERVICE_ID}&staffId=${STAFF_ID}&date=2026-02-30`,
++    );
++
++    expect(response.status).toBe(400);
++    expect(response.body.error.code).toBe("BAD_REQUEST");
++    expect(prismaMock.business.findFirst).not.toHaveBeenCalled();
++  });
++
++  it("rechaza referencias que no corresponden al negocio", async () => {
++    prismaMock.staffService.findUnique.mockResolvedValue(null);
++
++    const response = await request(app).get(query());
++
++    expect(response.status).toBe(400);
++    expect(response.body.error.code).toBe("INVALID_BOOKING_REFERENCE");
++  });
++
++  it("lista los horarios libres y excluye los ocupados por otras reservas", async () => {
++    prismaMock.booking.findMany.mockResolvedValue([
++      { startsAt: MONDAY_10AM_UTC, endsAt: MONDAY_1030AM_UTC },
++    ]);
++
++    const response = await request(app).get(query());
++
++    expect(response.status).toBe(200);
++    const { slots, timeZone, durationMinutes } = response.body.data;
++    expect(timeZone).toBe("America/Bogota");
++    expect(durationMinutes).toBe(30);
++
++    const times = slots.map((slot: { time: string }) => slot.time);
++    expect(times[0]).toBe("08:00");
++    expect(times).toContain("09:30");
++    expect(times).not.toContain("10:00");
++    expect(times).not.toContain("09:45");
++    expect(times).toContain("10:30");
++    expect(times[times.length - 1]).toBe("17:30");
++
++    expect(prismaMock.booking.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: expect.objectContaining({
++          staffId: STAFF_ID,
++          status: { in: ["PENDING", "CONFIRMED"] },
+         }),
+       }),
+     );
+   });
++
++  it("no ofrece horarios en un día en que el negocio no atiende", async () => {
++    const response = await request(app).get(query("2026-10-25"));
++
++    expect(response.status).toBe(200);
++    expect(response.body.data.slots).toEqual([]);
++  });
+ });
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/app.ts ./apps/api/src/app.ts
+--- ../turnia-original/apps/api/src/app.ts	2026-10-31 20:41:48.706587892 +0000
++++ ./apps/api/src/app.ts	2026-10-31 20:48:54.074357637 +0000
+@@ -3,10 +3,24 @@
+ import { prisma } from "./lib/prisma.js";
+ import {
+   createSessionToken,
+-  hashPassword,
+   hashSessionToken,
+   verifyPassword,
+ } from "./auth.js";
++import {
++  SESSION_DURATION_MS,
++  authorizeBusinessAccess,
++  clearedSessionCookie,
++  readSessionCookie,
++  sessionCookie,
++} from "./session.js";
++import {
++  checkSlot,
++  dayBounds,
++  getBookableSlots,
++  isValidDateString,
++  isValidTimeZone,
++} from "./availability.js";
++import { createRateLimiter } from "./rate-limit.js";
+ 
+ export const app = express();
+ 
+@@ -76,58 +90,11 @@
+   });
+ };
+ 
+-const SESSION_COOKIE = "turnia_session";
+-const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+-
+-function readSessionCookie(cookieHeader: string | undefined): string | null {
+-  if (!cookieHeader) return null;
+-
+-  for (const part of cookieHeader.split(";")) {
+-    const separator = part.indexOf("=");
+-    if (separator < 0) continue;
+-
+-    const name = part.slice(0, separator).trim();
+-    const value = part.slice(separator + 1).trim();
+-
+-    if (name === SESSION_COOKIE && /^[A-Za-z0-9_-]{43}$/.test(value)) {
+-      return value;
+-    }
+-  }
+-
+-  return null;
+-}
+-
+-function sessionCookie(token: string, maxAgeSeconds: number): string {
+-  const parts = [
+-    `${SESSION_COOKIE}=${token}`,
+-    "Path=/",
+-    "HttpOnly",
+-    "SameSite=Lax",
+-    `Max-Age=${maxAgeSeconds}`,
+-  ];
+-
+-  if (process.env.NODE_ENV === "production") {
+-    parts.push("Secure");
+-  }
+-
+-  return parts.join("; ");
+-}
+-
+-function clearedSessionCookie(): string {
+-  const parts = [
+-    `${SESSION_COOKIE}=`,
+-    "Path=/",
+-    "HttpOnly",
+-    "SameSite=Lax",
+-    "Max-Age=0",
+-  ];
+-
+-  if (process.env.NODE_ENV === "production") {
+-    parts.push("Secure");
+-  }
+-
+-  return parts.join("; ");
+-}
++// Límite de intentos de inicio de sesión: 10 por correo+IP cada 15 minutos.
++const loginLimiter = createRateLimiter({
++  maxAttempts: 10,
++  windowMs: 15 * 60 * 1000,
++});
+ 
+ app.post("/api/v1/auth/login", async (request, response) => {
+   const body: unknown = request.body;
+@@ -154,6 +121,18 @@
+ 
+   const emailNormalized = body.email.trim().toLowerCase();
+ 
++  const limiterKey = `${request.ip ?? "unknown"}|${emailNormalized}`;
++  if (!loginLimiter.hit(limiterKey)) {
++    response.status(429).json({
++      error: {
++        code: "TOO_MANY_ATTEMPTS",
++        message:
++          "Demasiados intentos de inicio de sesión. Espera unos minutos e inténtalo de nuevo.",
++      },
++    });
++    return;
++  }
++
+   const user = await prisma.user.findUnique({
+     where: { emailNormalized },
+     select: {
+@@ -179,6 +158,8 @@
+     return;
+   }
+ 
++  loginLimiter.reset(limiterKey);
++
+   const token = createSessionToken();
+   const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
+ 
+@@ -234,6 +215,21 @@
+           email: true,
+           fullName: true,
+           active: true,
++          memberships: {
++            orderBy: { createdAt: "asc" },
++            select: {
++              role: true,
++              business: {
++                select: {
++                  id: true,
++                  name: true,
++                  slug: true,
++                  timezone: true,
++                  active: true,
++                },
++              },
++            },
++          },
+         },
+       },
+     },
+@@ -249,6 +245,16 @@
+     return;
+   }
+ 
++  const memberships = (session.user.memberships ?? [])
++    .filter((membership) => membership.business.active)
++    .map((membership) => ({
++      businessId: membership.business.id,
++      businessName: membership.business.name,
++      businessSlug: membership.business.slug,
++      timezone: membership.business.timezone,
++      role: membership.role,
++    }));
++
+   response.status(200).json({
+     data: {
+       user: {
+@@ -256,6 +262,7 @@
+         email: session.user.email,
+         fullName: session.user.fullName,
+       },
++      memberships,
+       expiresAt: session.expiresAt.toISOString(),
+     },
+   });
+@@ -280,8 +287,7 @@
+   response.status(200).json({ data: { loggedOut: true } });
+ });
+ /**
+- * Lista las reservas de un negocio.
+- * Temporalmente usa businessId mientras se implementa autenticación.
++ * Lista las reservas de un negocio. Requiere sesión y membresía en el negocio.
+  */
+ app.get("/api/v1/bookings", async (request, response) => {
+   const businessId = request.query.businessId;
+@@ -296,61 +302,8 @@
+     return;
+   }
+ 
+-  const token = readSessionCookie(request.headers.cookie);
+-
+-  if (!token) {
+-    response.status(401).json({
+-      error: {
+-        code: "UNAUTHENTICATED",
+-        message: "Debes iniciar sesión.",
+-      },
+-    });
+-    return;
+-  }
+-
+-  const session = await prisma.session.findFirst({
+-    where: {
+-      tokenHash: hashSessionToken(token),
+-      revokedAt: null,
+-      expiresAt: { gt: new Date() },
+-    },
+-    select: {
+-      user: {
+-        select: {
+-          id: true,
+-          active: true,
+-        },
+-      },
+-    },
+-  });
+-
+-  if (!session || !session.user.active) {
+-    response.status(401).json({
+-      error: {
+-        code: "UNAUTHENTICATED",
+-        message: "La sesión no es válida o ha expirado.",
+-      },
+-    });
+-    return;
+-  }
+-
+-  const membership = await prisma.membership.findFirst({
+-    where: {
+-      businessId,
+-      userId: session.user.id,
+-    },
+-    select: { id: true },
+-  });
+-
+-  if (!membership) {
+-    response.status(403).json({
+-      error: {
+-        code: "FORBIDDEN",
+-        message: "No tienes permiso para consultar las reservas de este negocio.",
+-      },
+-    });
+-    return;
+-  }
++  const access = await authorizeBusinessAccess(request, response, businessId);
++  if (!access) return;
+ 
+   const bookings = await prisma.booking.findMany({
+     where: { businessId },
+@@ -375,7 +328,7 @@
+   response.status(200).json({
+     data: bookings,
+   });
+-});
++});
+ 
+ /**
+  * Catálogo de un negocio: servicios activos y empleados
+@@ -480,7 +433,24 @@
+   });
+ });
+ 
+-// Crear una reserva.
++const slotRejectionMessages: Record<
++  | "INVALID_START"
++  | "PAST"
++  | "OUTSIDE_BUSINESS_HOURS"
++  | "OUTSIDE_STAFF_AVAILABILITY"
++  | "BUSINESS_CLOSED"
++  | "STAFF_TIME_OFF",
++  string
++> = {
++  INVALID_START: "La hora de inicio debe ser exacta (sin segundos).",
++  PAST: "No se puede reservar en un horario que ya pasó.",
++  OUTSIDE_BUSINESS_HOURS: "El negocio no atiende en ese horario.",
++  OUTSIDE_STAFF_AVAILABILITY: "El empleado no trabaja en ese horario.",
++  BUSINESS_CLOSED: "El negocio está cerrado en ese horario.",
++  STAFF_TIME_OFF: "El empleado tiene una ausencia o descanso en ese horario.",
++};
++
++// Crear una reserva. Requiere sesión y membresía en el negocio.
+ app.post("/api/v1/bookings", async (request, response) => {
+   const body: unknown = request.body;
+ 
+@@ -583,6 +553,10 @@
+   const normalizedPhone =
+     typeof phone === "string" && phone.trim() ? phone.trim() : null;
+ 
++  // Crear reservas desde el panel exige sesión y membresía en el negocio.
++  const access = await authorizeBusinessAccess(request, response, businessId);
++  if (!access) return;
++
+   try {
+     const result = await prisma.$transaction(async (tx) => {
+       // Verificar que el negocio exista y esté activo.
+@@ -594,6 +568,7 @@
+         select: {
+           id: true,
+           bookingHoldMinutes: true,
++          timezone: true,
+         },
+       });
+ 
+@@ -636,6 +611,51 @@
+       // Calcular la hora de finalización.
+       const end = new Date(start.getTime() + service.durationMinutes * 60_000);
+ 
++      // Validar horarios del negocio y del profesional, cierres y ausencias.
++      // Los choques con otras reservas los resuelve PostgreSQL (restricción
++      // de exclusión), que es la única defensa segura ante concurrencia.
++      const timeZone = isValidTimeZone(business.timezone)
++        ? business.timezone
++        : "America/Bogota";
++
++      const businessWindows = await tx.businessHours.findMany({
++        where: { businessId, active: true },
++        select: { weekday: true, startMinute: true, endMinute: true },
++      });
++      const staffWindows = await tx.staffAvailability.findMany({
++        where: { staffId, active: true },
++        select: { weekday: true, startMinute: true, endMinute: true },
++      });
++      const closures = await tx.businessClosure.findMany({
++        where: { businessId, startsAt: { lt: end }, endsAt: { gt: start } },
++        select: { startsAt: true, endsAt: true },
++      });
++      const timeOffs = await tx.timeOff.findMany({
++        where: { staffId, startsAt: { lt: end }, endsAt: { gt: start } },
++        select: { startsAt: true, endsAt: true },
++      });
++
++      const verdict = checkSlot({
++        timeZone,
++        startsAt: start,
++        durationMinutes: service.durationMinutes,
++        businessWindows,
++        staffWindows,
++        closures: closures.map((item) => ({
++          start: item.startsAt,
++          end: item.endsAt,
++        })),
++        timeOffs: timeOffs.map((item) => ({
++          start: item.startsAt,
++          end: item.endsAt,
++        })),
++        now: new Date(),
++      });
++
++      if (!verdict.ok) {
++        return { kind: "unavailable" as const, reason: verdict.reason };
++      }
++
+       // Buscar al cliente por correo o teléfono dentro del negocio.
+       let customer = null;
+ 
+@@ -690,6 +710,7 @@
+           customerId: customer.id,
+           serviceId,
+           staffId,
++          createdByUserId: access.userId,
+           source: "PANEL",
+           status: "CONFIRMED",
+ 
+@@ -746,6 +767,18 @@
+       return;
+     }
+ 
++    // Horario fuera de la agenda del negocio o del profesional.
++    if (result.kind === "unavailable") {
++      response.status(422).json({
++        error: {
++          code: "SLOT_UNAVAILABLE",
++          message: slotRejectionMessages[result.reason],
++          details: { reason: result.reason },
++        },
++      });
++      return;
++    }
++
+     // Reserva creada correctamente.
+     response.status(201).json({
+       data: result.booking,
+@@ -809,6 +842,117 @@
+   }
+ });
+ 
++/**
++ * Horarios disponibles de un servicio con un empleado en una fecha local del
++ * negocio. Es pública (como el catálogo) y solo expone intervalos libres, sin
++ * datos de clientes.
++ */
++app.get("/api/v1/availability", async (request, response) => {
++  const { businessId, serviceId, staffId, date } = request.query;
++
++  if (
++    typeof businessId !== "string" ||
++    !uuidPattern.test(businessId) ||
++    typeof serviceId !== "string" ||
++    !uuidPattern.test(serviceId) ||
++    typeof staffId !== "string" ||
++    !uuidPattern.test(staffId) ||
++    typeof date !== "string" ||
++    !isValidDateString(date)
++  ) {
++    response.status(400).json({
++      error: {
++        code: "BAD_REQUEST",
++        message: "Revisa businessId, serviceId, staffId y date (AAAA-MM-DD)",
++      },
++    });
++    return;
++  }
++
++  const business = await prisma.business.findFirst({
++    where: { id: businessId, active: true },
++    select: { id: true, timezone: true },
++  });
++  const service = await prisma.service.findFirst({
++    where: { id: serviceId, businessId, active: true },
++    select: { id: true, durationMinutes: true },
++  });
++  const staff = await prisma.staff.findFirst({
++    where: { id: staffId, businessId, active: true },
++    select: { id: true },
++  });
++  const assignment =
++    business && service && staff
++      ? await prisma.staffService.findUnique({
++          where: { staffId_serviceId: { staffId, serviceId } },
++        })
++      : null;
++
++  if (!business || !service || !staff || !assignment) {
++    response.status(400).json({
++      error: {
++        code: "INVALID_BOOKING_REFERENCE",
++        message:
++          "El negocio, servicio o empleado no existe, está inactivo o no corresponde al servicio",
++      },
++    });
++    return;
++  }
++
++  const timeZone = isValidTimeZone(business.timezone)
++    ? business.timezone
++    : "America/Bogota";
++  const day = dayBounds(date, timeZone);
++
++  const businessWindows = await prisma.businessHours.findMany({
++    where: { businessId, active: true },
++    select: { weekday: true, startMinute: true, endMinute: true },
++  });
++  const staffWindows = await prisma.staffAvailability.findMany({
++    where: { staffId, active: true },
++    select: { weekday: true, startMinute: true, endMinute: true },
++  });
++  const closures = await prisma.businessClosure.findMany({
++    where: { businessId, startsAt: { lt: day.end }, endsAt: { gt: day.start } },
++    select: { startsAt: true, endsAt: true },
++  });
++  const timeOffs = await prisma.timeOff.findMany({
++    where: { staffId, startsAt: { lt: day.end }, endsAt: { gt: day.start } },
++    select: { startsAt: true, endsAt: true },
++  });
++  const activeBookings = await prisma.booking.findMany({
++    where: {
++      staffId,
++      status: { in: ["PENDING", "CONFIRMED"] },
++      startsAt: { lt: day.end },
++      endsAt: { gt: day.start },
++    },
++    select: { startsAt: true, endsAt: true },
++  });
++
++  const slots = getBookableSlots({
++    timeZone,
++    date,
++    durationMinutes: service.durationMinutes,
++    businessWindows,
++    staffWindows,
++    blocked: [...closures, ...timeOffs, ...activeBookings].map((item) => ({
++      start: item.startsAt,
++      end: item.endsAt,
++    })),
++    now: new Date(),
++  });
++
++  response.status(200).json({
++    data: {
++      date,
++      timeZone,
++      durationMinutes: service.durationMinutes,
++      slots,
++    },
++  });
++});
++
+ // Ruta 404 para endpoints inexistentes.
+ app.use((_request, response) => {
+   response.status(404).json({
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/auth-client.test.mjs ./apps/api/src/auth-client.test.mjs
+--- ../turnia-original/apps/api/src/auth-client.test.mjs	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/auth-client.test.mjs	2026-10-31 20:49:18.260350761 +0000
+@@ -0,0 +1,91 @@
++import { describe, expect, it, vi } from "vitest";
++import {
++  fetchSession,
++  loginRequest,
++  logoutRequest,
++  parseSessionInfo,
++} from "../../web/src/auth-api.ts";
++
++const json = (body, status = 200) =>
++  new Response(JSON.stringify(body), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++
++const sessionBody = {
++  data: {
++    user: { id: "u1", email: "a@b.co", fullName: "Ana Pérez" },
++    memberships: [
++      {
++        businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++        businessName: "Turnia Demo",
++        businessSlug: "turnia-demo",
++        timezone: "America/Bogota",
++        role: "OWNER",
++      },
++    ],
++    expiresAt: "2026-11-07T00:00:00.000Z",
++  },
++};
++
++describe("cliente de autenticación", () => {
++  it("interpreta la sesión y descarta roles desconocidos", () => {
++    expect(parseSessionInfo(sessionBody)?.memberships[0]?.role).toBe("OWNER");
++    const invalid = structuredClone(sessionBody);
++    invalid.data.memberships[0].role = "SUPERADMIN";
++    expect(parseSessionInfo(invalid)).toBeNull();
++    expect(parseSessionInfo({ data: { user: {} } })).toBeNull();
++  });
++
++  it("devuelve null cuando no hay sesión (401)", async () => {
++    const request = vi.fn().mockResolvedValue(json({ error: {} }, 401));
++    await expect(fetchSession(request)).resolves.toBeNull();
++  });
++
++  it("devuelve la sesión válida y falla ante respuestas inesperadas", async () => {
++    await expect(
++      fetchSession(vi.fn().mockResolvedValue(json(sessionBody))),
++    ).resolves.toMatchObject({ user: { fullName: "Ana Pérez" } });
++    await expect(
++      fetchSession(vi.fn().mockResolvedValue(json({ nope: true }))),
++    ).rejects.toThrow("formato inesperado");
++    await expect(
++      fetchSession(vi.fn().mockResolvedValue(json({}, 500))),
++    ).rejects.toThrow("código 500");
++  });
++
++  it("envía las credenciales por POST y traduce los errores", async () => {
++    const ok = vi.fn().mockResolvedValue(json({ data: {} }));
++    await loginRequest("a@b.co", "clave", ok);
++    expect(ok).toHaveBeenCalledWith(
++      "/api/v1/auth/login",
++      expect.objectContaining({
++        method: "POST",
++        body: JSON.stringify({ email: "a@b.co", password: "clave" }),
++      }),
++    );
++
++    await expect(
++      loginRequest("a@b.co", "x", vi.fn().mockResolvedValue(json({}, 401))),
++    ).rejects.toThrow("Correo o contraseña incorrectos.");
++    await expect(
++      loginRequest(
++        "a@b.co",
++        "x",
++        vi
++          .fn()
++          .mockResolvedValue(
++            json({ error: { message: "Demasiados intentos." } }, 429),
++          ),
++      ),
++    ).rejects.toThrow("Demasiados intentos.");
++  });
++
++  it("cierra la sesión con POST", async () => {
++    const request = vi.fn().mockResolvedValue(json({ data: {} }));
++    await logoutRequest(request);
++    expect(request).toHaveBeenCalledWith("/api/v1/auth/logout", {
++      method: "POST",
++    });
++  });
++});
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/auth.routes.test.ts ./apps/api/src/auth.routes.test.ts
+--- ../turnia-original/apps/api/src/auth.routes.test.ts	2026-10-31 20:41:48.706644381 +0000
++++ ./apps/api/src/auth.routes.test.ts	2026-10-31 20:48:55.337092502 +0000
+@@ -1,12 +1,5 @@
+ import request from "supertest";
+-import {
+-  beforeAll,
+-  beforeEach,
+-  describe,
+-  expect,
+-  it,
+-  vi,
+-} from "vitest";
++import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ const { prismaMock } = vi.hoisted(() => ({
+   prismaMock: {
+@@ -26,11 +19,7 @@
+ }));
+ 
+ import { app } from "./app.js";
+-import {
+-  createSessionToken,
+-  hashPassword,
+-  hashSessionToken,
+-} from "./auth.js";
++import { createSessionToken, hashPassword, hashSessionToken } from "./auth.js";
+ 
+ const testPassword = "Turnia-Pruebas-2026!";
+ let passwordHash: string;
+@@ -56,12 +45,10 @@
+     prismaMock.user.findUnique.mockResolvedValue(activeUser());
+     prismaMock.session.create.mockResolvedValue({});
+ 
+-    const response = await request(app)
+-      .post("/api/v1/auth/login")
+-      .send({
+-        email: "  ADMIN@TURNIA.TEST ",
+-        password: testPassword,
+-      });
++    const response = await request(app).post("/api/v1/auth/login").send({
++      email: "  ADMIN@TURNIA.TEST ",
++      password: testPassword,
++    });
+ 
+     expect(response.status).toBe(200);
+     expect(response.body.data.user).toEqual({
+@@ -70,9 +57,7 @@
+       fullName: "Administrador de pruebas",
+     });
+     expect(response.headers["set-cookie"]).toBeDefined();
+-    expect(response.headers["set-cookie"]![0]!).toContain(
+-      "turnia_session=",
+-    );
++    expect(response.headers["set-cookie"]![0]!).toContain("turnia_session=");
+     expect(response.headers["set-cookie"]![0]!).toContain("HttpOnly");
+     expect(response.headers["set-cookie"]![0]!).toContain("SameSite=Lax");
+ 
+@@ -82,14 +67,12 @@
+       }),
+     );
+ 
+-    const createdSession =
+-      prismaMock.session.create.mock.calls[0]![0];
++    const createdSession = prismaMock.session.create.mock.calls[0]![0];
+ 
+     expect(createdSession.data.userId).toBe("user-test-001");
+     expect(createdSession.data.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+     expect(createdSession.data.tokenHash).not.toBe(
+-      response.headers["set-cookie"]![0]!
+-        .match(/turnia_session=([^;]+)/)?.[1],
++      response.headers["set-cookie"]![0]!.match(/turnia_session=([^;]+)/)?.[1],
+     );
+     expect(createdSession.data.expiresAt).toBeInstanceOf(Date);
+   });
+@@ -97,12 +80,10 @@
+   it("rechaza credenciales incorrectas con un mensaje genérico", async () => {
+     prismaMock.user.findUnique.mockResolvedValue(null);
+ 
+-    const response = await request(app)
+-      .post("/api/v1/auth/login")
+-      .send({
+-        email: "desconocido@turnia.test",
+-        password: testPassword,
+-      });
++    const response = await request(app).post("/api/v1/auth/login").send({
++      email: "desconocido@turnia.test",
++      password: testPassword,
++    });
+ 
+     expect(response.status).toBe(401);
+     expect(response.body.error.code).toBe("INVALID_CREDENTIALS");
+@@ -173,9 +154,74 @@
+       },
+     });
+ 
+-    expect(response.headers["set-cookie"]![0]!).toContain(
+-      "turnia_session=",
+-    );
++    expect(response.headers["set-cookie"]![0]!).toContain("turnia_session=");
+     expect(response.headers["set-cookie"]![0]!).toContain("Max-Age=0");
+   });
+-});
+\ No newline at end of file
++
++  it("incluye en /me solo las membresías de negocios activos", async () => {
++    const token = createSessionToken();
++
++    prismaMock.session.findFirst.mockResolvedValue({
++      expiresAt: new Date(Date.now() + 60_000),
++      user: {
++        id: "user-test-001",
++        email: "admin@turnia.test",
++        fullName: "Administrador de pruebas",
++        active: true,
++        memberships: [
++          {
++            role: "OWNER",
++            business: {
++              id: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++              name: "Turnia Demo",
++              slug: "turnia-demo",
++              timezone: "America/Bogota",
++              active: true,
++            },
++          },
++          {
++            role: "STAFF",
++            business: {
++              id: "9a1f5d00-0000-4000-8000-000000000001",
++              name: "Negocio inactivo",
++              slug: "inactivo",
++              timezone: "America/Bogota",
++              active: false,
++            },
++          },
++        ],
++      },
++    });
++
++    const response = await request(app)
++      .get("/api/v1/auth/me")
++      .set("Cookie", `turnia_session=${token}`);
++
++    expect(response.status).toBe(200);
++    expect(response.body.data.memberships).toEqual([
++      {
++        businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++        businessName: "Turnia Demo",
++        businessSlug: "turnia-demo",
++        timezone: "America/Bogota",
++        role: "OWNER",
++      },
++    ]);
++    expect(JSON.stringify(response.body)).not.toContain("passwordHash");
++  });
++
++  it("limita los intentos repetidos de inicio de sesión (429)", async () => {
++    prismaMock.user.findUnique.mockResolvedValue(null);
++
++    const statuses: number[] = [];
++    for (let attempt = 0; attempt < 11; attempt += 1) {
++      const response = await request(app)
++        .post("/api/v1/auth/login")
++        .send({ email: "bloqueado@turnia.test", password: testPassword });
++      statuses.push(response.status);
++    }
++
++    expect(statuses.slice(0, 10).every((status) => status === 401)).toBe(true);
++    expect(statuses[10]).toBe(429);
++  });
++});
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/availability.test.ts ./apps/api/src/availability.test.ts
+--- ../turnia-original/apps/api/src/availability.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/availability.test.ts	2026-10-31 20:48:55.565092516 +0000
+@@ -0,0 +1,240 @@
++import { describe, expect, it } from "vitest";
++import {
++  checkSlot,
++  dayBounds,
++  getBookableSlots,
++  isValidDateString,
++  localDateAndMinute,
++  weekdayOfDate,
++  zonedMinuteToInstant,
++  type WeeklyWindow,
++} from "./availability.js";
++
++const BOGOTA = "America/Bogota";
++const weekdays = (days: number[], from = 8 * 60, to = 18 * 60) =>
++  days.map<WeeklyWindow>((weekday) => ({
++    weekday,
++    startMinute: from,
++    endMinute: to,
++  }));
++
++const MON_TO_SAT = weekdays([1, 2, 3, 4, 5, 6]);
++const NOW = new Date("2026-10-20T12:00:00.000Z");
++
++describe("utilidades de fecha y zona horaria", () => {
++  it("valida fechas reales de calendario", () => {
++    expect(isValidDateString("2026-10-26")).toBe(true);
++    expect(isValidDateString("2026-02-30")).toBe(false);
++    expect(isValidDateString("2026-2-3")).toBe(false);
++    expect(isValidDateString("no-es-fecha")).toBe(false);
++  });
++
++  it("calcula el día de la semana (0 = domingo)", () => {
++    expect(weekdayOfDate("2026-10-25")).toBe(0);
++    expect(weekdayOfDate("2026-10-26")).toBe(1);
++  });
++
++  it("convierte hora local de Bogotá a UTC (UTC-5 sin horario de verano)", () => {
++    expect(
++      zonedMinuteToInstant("2026-10-26", 10 * 60, BOGOTA).toISOString(),
++    ).toBe("2026-10-26T15:00:00.000Z");
++  });
++
++  it("respeta el cambio de horario de verano en otras zonas", () => {
++    const zone = "America/New_York";
++    // 2026-03-08 es el día en que EE. UU. adelanta el reloj.
++    expect(
++      zonedMinuteToInstant("2026-03-07", 10 * 60, zone).toISOString(),
++    ).toBe("2026-03-07T15:00:00.000Z");
++    expect(
++      zonedMinuteToInstant("2026-03-08", 10 * 60, zone).toISOString(),
++    ).toBe("2026-03-08T14:00:00.000Z");
++  });
++
++  it("obtiene fecha local y minuto del día de un instante", () => {
++    const local = localDateAndMinute(
++      new Date("2026-10-27T03:30:00.000Z"),
++      BOGOTA,
++    );
++    expect(local.date).toBe("2026-10-26");
++    expect(local.minuteOfDay).toBe(22 * 60 + 30);
++    expect(local.hasSubMinute).toBe(false);
++  });
++
++  it("calcula los límites de un día local", () => {
++    const bounds = dayBounds("2026-10-26", BOGOTA);
++    expect(bounds.start.toISOString()).toBe("2026-10-26T05:00:00.000Z");
++    expect(bounds.end.toISOString()).toBe("2026-10-27T05:00:00.000Z");
++  });
++});
++
++describe("getBookableSlots", () => {
++  const base = {
++    timeZone: BOGOTA,
++    date: "2026-10-26",
++    durationMinutes: 30,
++    businessWindows: MON_TO_SAT,
++    staffWindows: MON_TO_SAT,
++    blocked: [],
++    now: NOW,
++  };
++
++  it("genera horarios cada 15 minutos dentro de la jornada", () => {
++    const times = getBookableSlots(base).map((slot) => slot.time);
++    expect(times[0]).toBe("08:00");
++    expect(times[1]).toBe("08:15");
++    expect(times[times.length - 1]).toBe("17:30");
++    expect(times).toHaveLength(39);
++  });
++
++  it("devuelve instantes UTC correctos", () => {
++    const first = getBookableSlots(base)[0]!;
++    expect(first.startsAt).toBe("2026-10-26T13:00:00.000Z");
++    expect(first.endsAt).toBe("2026-10-26T13:30:00.000Z");
++  });
++
++  it("usa la intersección entre el horario del negocio y el del empleado", () => {
++    const times = getBookableSlots({
++      ...base,
++      staffWindows: weekdays([1], 13 * 60, 15 * 60),
++    }).map((slot) => slot.time);
++    expect(times[0]).toBe("13:00");
++    expect(times[times.length - 1]).toBe("14:30");
++  });
++
++  it("no ofrece nada si el empleado no tiene horario ese día", () => {
++    expect(getBookableSlots({ ...base, staffWindows: weekdays([2]) })).toEqual(
++      [],
++    );
++  });
++
++  it("excluye descansos, cierres y reservas con intervalos semiabiertos", () => {
++    const times = getBookableSlots({
++      ...base,
++      blocked: [
++        {
++          start: new Date("2026-10-26T15:00:00.000Z"), // 10:00
++          end: new Date("2026-10-26T16:00:00.000Z"), // 11:00
++        },
++      ],
++    }).map((slot) => slot.time);
++
++    expect(times).toContain("09:30"); // termina justo a las 10:00
++    expect(times).not.toContain("09:45");
++    expect(times).not.toContain("10:00");
++    expect(times).not.toContain("10:45");
++    expect(times).toContain("11:00"); // empieza justo cuando termina el bloqueo
++  });
++
++  it("excluye horarios que ya pasaron el mismo día", () => {
++    const times = getBookableSlots({
++      ...base,
++      now: new Date("2026-10-26T15:10:00.000Z"), // 10:10 en Bogotá
++    }).map((slot) => slot.time);
++    expect(times[0]).toBe("10:15");
++  });
++
++  it("devuelve una lista vacía con datos inválidos", () => {
++    expect(getBookableSlots({ ...base, date: "2026-13-01" })).toEqual([]);
++    expect(getBookableSlots({ ...base, durationMinutes: 0 })).toEqual([]);
++  });
++
++  it("no ofrece servicios que no caben antes del cierre", () => {
++    const times = getBookableSlots({ ...base, durationMinutes: 120 }).map(
++      (slot) => slot.time,
++    );
++    expect(times[times.length - 1]).toBe("16:00");
++  });
++});
++
++describe("checkSlot", () => {
++  const base = {
++    timeZone: BOGOTA,
++    startsAt: new Date("2026-10-26T15:00:00.000Z"), // lunes 10:00
++    durationMinutes: 30,
++    businessWindows: MON_TO_SAT,
++    staffWindows: MON_TO_SAT,
++    closures: [],
++    timeOffs: [],
++    now: NOW,
++  };
++
++  it("acepta un horario válido", () => {
++    expect(checkSlot(base)).toEqual({ ok: true });
++  });
++
++  it("acepta una reserva que termina exactamente al cierre", () => {
++    expect(
++      checkSlot({ ...base, startsAt: new Date("2026-10-26T22:30:00.000Z") }),
++    ).toEqual({ ok: true }); // 17:30 → 18:00
++  });
++
++  it("rechaza una reserva que termina después del cierre", () => {
++    expect(
++      checkSlot({ ...base, startsAt: new Date("2026-10-26T22:45:00.000Z") }),
++    ).toEqual({ ok: false, reason: "OUTSIDE_BUSINESS_HOURS" });
++  });
++
++  it("rechaza horarios en el pasado", () => {
++    expect(
++      checkSlot({ ...base, now: new Date("2026-10-27T00:00:00.000Z") }),
++    ).toEqual({ ok: false, reason: "PAST" });
++  });
++
++  it("rechaza horas con segundos o milisegundos", () => {
++    expect(
++      checkSlot({ ...base, startsAt: new Date("2026-10-26T15:00:30.000Z") }),
++    ).toEqual({ ok: false, reason: "INVALID_START" });
++  });
++
++  it("distingue horario del negocio y horario del empleado", () => {
++    expect(checkSlot({ ...base, businessWindows: weekdays([2]) })).toEqual({
++      ok: false,
++      reason: "OUTSIDE_BUSINESS_HOURS",
++    });
++    expect(checkSlot({ ...base, staffWindows: [] })).toEqual({
++      ok: false,
++      reason: "OUTSIDE_STAFF_AVAILABILITY",
++    });
++  });
++
++  it("detecta cierres y ausencias que se solapan", () => {
++    const interval = {
++      start: new Date("2026-10-26T15:15:00.000Z"),
++      end: new Date("2026-10-26T16:00:00.000Z"),
++    };
++    expect(checkSlot({ ...base, closures: [interval] })).toEqual({
++      ok: false,
++      reason: "BUSINESS_CLOSED",
++    });
++    expect(checkSlot({ ...base, timeOffs: [interval] })).toEqual({
++      ok: false,
++      reason: "STAFF_TIME_OFF",
++    });
++  });
++
++  it("no considera ausencia un intervalo que termina justo al empezar la cita", () => {
++    expect(
++      checkSlot({
++        ...base,
++        timeOffs: [
++          {
++            start: new Date("2026-10-26T14:00:00.000Z"),
++            end: new Date("2026-10-26T15:00:00.000Z"),
++          },
++        ],
++      }),
++    ).toEqual({ ok: true });
++  });
++
++  it("usa la fecha local del negocio, no la UTC, para elegir el día", () => {
++    // 2026-10-27T03:00Z es lunes 22:00 en Bogotá: fuera de horario, no martes.
++    expect(
++      checkSlot({
++        ...base,
++        startsAt: new Date("2026-10-27T03:00:00.000Z"),
++        businessWindows: weekdays([2]),
++      }),
++    ).toEqual({ ok: false, reason: "OUTSIDE_BUSINESS_HOURS" });
++  });
++});
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/availability.ts ./apps/api/src/availability.ts
+--- ../turnia-original/apps/api/src/availability.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/availability.ts	2026-10-31 20:48:55.477092511 +0000
+@@ -0,0 +1,357 @@
++/**
++ * Motor de disponibilidad de Turnia.
++ *
++ * Funciones puras: no acceden a la base de datos ni al reloj del sistema
++ * (el reloj llega como parámetro `now`), por lo que se pueden probar sin
++ * PostgreSQL.
++ *
++ * Convenciones:
++ * - `weekday`: 0 = domingo ... 6 = sábado (igual que `Date#getDay`).
++ * - `startMinute` / `endMinute`: minutos desde las 00:00 en la zona horaria
++ *   del negocio. `endMinute` puede ser 1440 (medianoche) y es exclusivo.
++ * - Los instantes se manejan siempre como `Date` (UTC) y los intervalos son
++ *   semiabiertos [inicio, fin), igual que la restricción de PostgreSQL
++ *   `tstzrange(..., '[)')`.
++ */
++
++export type Interval = { start: Date; end: Date };
++
++export type WeeklyWindow = {
++  weekday: number;
++  startMinute: number;
++  endMinute: number;
++};
++
++export type SlotRejectionReason =
++  | "INVALID_START"
++  | "PAST"
++  | "OUTSIDE_BUSINESS_HOURS"
++  | "OUTSIDE_STAFF_AVAILABILITY"
++  | "BUSINESS_CLOSED"
++  | "STAFF_TIME_OFF";
++
++export type SlotCheck =
++  { ok: true } | { ok: false; reason: SlotRejectionReason };
++
++export type BookableSlot = {
++  startsAt: string;
++  endsAt: string;
++  /** Hora local del negocio en formato HH:MM. */
++  time: string;
++};
++
++export const DEFAULT_SLOT_STEP_MINUTES = 15;
++
++const MINUTE_MS = 60_000;
++
++type ZonedParts = {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++};
++
++const formatterCache = new Map<string, Intl.DateTimeFormat>();
++
++function formatterFor(timeZone: string): Intl.DateTimeFormat {
++  let formatter = formatterCache.get(timeZone);
++  if (!formatter) {
++    formatter = new Intl.DateTimeFormat("en-US", {
++      timeZone,
++      hourCycle: "h23",
++      year: "numeric",
++      month: "2-digit",
++      day: "2-digit",
++      hour: "2-digit",
++      minute: "2-digit",
++      second: "2-digit",
++    });
++    formatterCache.set(timeZone, formatter);
++  }
++  return formatter;
++}
++
++function zonedParts(instant: Date, timeZone: string): ZonedParts {
++  const values: Record<string, number> = {};
++  for (const part of formatterFor(timeZone).formatToParts(instant)) {
++    if (part.type !== "literal") values[part.type] = Number(part.value);
++  }
++  return {
++    year: values.year ?? 0,
++    month: values.month ?? 0,
++    day: values.day ?? 0,
++    hour: values.hour ?? 0,
++    minute: values.minute ?? 0,
++    second: values.second ?? 0,
++  };
++}
++
++/** Diferencia (zona − UTC) en milisegundos para un instante dado. */
++function offsetMs(utcMs: number, timeZone: string): number {
++  const parts = zonedParts(new Date(utcMs), timeZone);
++  const asUtc = Date.UTC(
++    parts.year,
++    parts.month - 1,
++    parts.day,
++    parts.hour,
++    parts.minute,
++    parts.second,
++  );
++  return asUtc - Math.floor(utcMs / 1000) * 1000;
++}
++
++export function isValidTimeZone(timeZone: string): boolean {
++  try {
++    new Intl.DateTimeFormat("en-US", { timeZone });
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** Valida `YYYY-MM-DD` y que sea una fecha real del calendario. */
++export function isValidDateString(value: string): boolean {
++  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
++  if (!match) return false;
++  const [year, month, day] = [
++    Number(match[1]),
++    Number(match[2]),
++    Number(match[3]),
++  ];
++  const probe = new Date(Date.UTC(year, month - 1, day));
++  return (
++    probe.getUTCFullYear() === year &&
++    probe.getUTCMonth() === month - 1 &&
++    probe.getUTCDate() === day
++  );
++}
++
++/** Día de la semana (0 = domingo) de una fecha de calendario. */
++export function weekdayOfDate(date: string): number {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
++}
++
++/**
++ * Convierte "fecha local + minuto del día" en el instante UTC equivalente
++ * para la zona horaria indicada. `minuteOfDay` puede llegar a 1440.
++ */
++export function zonedMinuteToInstant(
++  date: string,
++  minuteOfDay: number,
++  timeZone: string,
++): Date {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  const naive = Date.UTC(year, month - 1, day, 0, minuteOfDay, 0);
++  let utc = naive - offsetMs(naive, timeZone);
++  const corrected = naive - offsetMs(utc, timeZone);
++  if (corrected !== utc) utc = corrected;
++  return new Date(utc);
++}
++
++/** Inicio y fin (exclusivo) de un día calendario en la zona del negocio. */
++export function dayBounds(date: string, timeZone: string): Interval {
++  return {
++    start: zonedMinuteToInstant(date, 0, timeZone),
++    end: zonedMinuteToInstant(date, 1440, timeZone),
++  };
++}
++
++/** Fecha local (YYYY-MM-DD) y minuto del día de un instante en la zona dada. */
++export function localDateAndMinute(
++  instant: Date,
++  timeZone: string,
++): { date: string; minuteOfDay: number; hasSubMinute: boolean } {
++  const parts = zonedParts(instant, timeZone);
++  const date = `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
++  return {
++    date,
++    minuteOfDay: parts.hour * 60 + parts.minute,
++    hasSubMinute: parts.second !== 0 || instant.getUTCMilliseconds() !== 0,
++  };
++}
++
++function formatMinute(minuteOfDay: number): string {
++  const hours = Math.floor(minuteOfDay / 60);
++  const minutes = minuteOfDay % 60;
++  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
++}
++
++function windowsFor(
++  windows: readonly WeeklyWindow[],
++  weekday: number,
++): [number, number][] {
++  return windows
++    .filter(
++      (window) =>
++        window.weekday === weekday &&
++        Number.isInteger(window.startMinute) &&
++        Number.isInteger(window.endMinute) &&
++        window.startMinute >= 0 &&
++        window.endMinute <= 1440 &&
++        window.startMinute < window.endMinute,
++    )
++    .map((window) => [window.startMinute, window.endMinute]);
++}
++
++function intersect(
++  first: readonly [number, number][],
++  second: readonly [number, number][],
++): [number, number][] {
++  const result: [number, number][] = [];
++  for (const [aStart, aEnd] of first) {
++    for (const [bStart, bEnd] of second) {
++      const start = Math.max(aStart, bStart);
++      const end = Math.min(aEnd, bEnd);
++      if (start < end) result.push([start, end]);
++    }
++  }
++  return result.sort((left, right) => left[0] - right[0]);
++}
++
++function overlaps(
++  start: Date,
++  end: Date,
++  intervals: readonly Interval[],
++): boolean {
++  return intervals.some(
++    (interval) => start < interval.end && end > interval.start,
++  );
++}
++
++export type CheckSlotInput = {
++  timeZone: string;
++  startsAt: Date;
++  durationMinutes: number;
++  businessWindows: readonly WeeklyWindow[];
++  staffWindows: readonly WeeklyWindow[];
++  closures: readonly Interval[];
++  timeOffs: readonly Interval[];
++  now: Date;
++};
++
++/**
++ * Valida una hora de inicio concreta contra horarios del negocio, horarios
++ * del profesional, cierres y descansos/ausencias.
++ *
++ * NO comprueba choques con otras reservas: eso lo garantiza PostgreSQL con
++ * la restricción de exclusión `booking_staff_no_overlapping_active`, que es
++ * la única forma segura frente a solicitudes simultáneas.
++ */
++export function checkSlot(input: CheckSlotInput): SlotCheck {
++  const { startsAt, durationMinutes, timeZone } = input;
++
++  if (
++    !Number.isFinite(startsAt.getTime()) ||
++    !Number.isInteger(durationMinutes) ||
++    durationMinutes <= 0
++  ) {
++    return { ok: false, reason: "INVALID_START" };
++  }
++
++  const local = localDateAndMinute(startsAt, timeZone);
++  if (local.hasSubMinute) return { ok: false, reason: "INVALID_START" };
++
++  if (startsAt.getTime() < input.now.getTime()) {
++    return { ok: false, reason: "PAST" };
++  }
++
++  const weekday = weekdayOfDate(local.date);
++  const endMinute = local.minuteOfDay + durationMinutes;
++  const fits = (ranges: readonly [number, number][]) =>
++    ranges.some(
++      ([start, end]) => local.minuteOfDay >= start && endMinute <= end,
++    );
++
++  if (!fits(windowsFor(input.businessWindows, weekday))) {
++    return { ok: false, reason: "OUTSIDE_BUSINESS_HOURS" };
++  }
++  if (!fits(windowsFor(input.staffWindows, weekday))) {
++    return { ok: false, reason: "OUTSIDE_STAFF_AVAILABILITY" };
++  }
++
++  const endsAt = new Date(startsAt.getTime() + durationMinutes * MINUTE_MS);
++  if (overlaps(startsAt, endsAt, input.closures)) {
++    return { ok: false, reason: "BUSINESS_CLOSED" };
++  }
++  if (overlaps(startsAt, endsAt, input.timeOffs)) {
++    return { ok: false, reason: "STAFF_TIME_OFF" };
++  }
++
++  return { ok: true };
++}
++
++export type BookableSlotsInput = {
++  timeZone: string;
++  /** Fecha local del negocio, formato YYYY-MM-DD. */
++  date: string;
++  durationMinutes: number;
++  businessWindows: readonly WeeklyWindow[];
++  staffWindows: readonly WeeklyWindow[];
++  /** Cierres del negocio, descansos del profesional y reservas activas. */
++  blocked: readonly Interval[];
++  now: Date;
++  stepMinutes?: number;
++};
++
++/**
++ * Lista los inicios posibles de un servicio en un día: la intersección entre
++ * el horario del negocio y el del profesional, descontando bloqueos y
++ * excluyendo instantes ya pasados.
++ */
++export function getBookableSlots(input: BookableSlotsInput): BookableSlot[] {
++  const step = input.stepMinutes ?? DEFAULT_SLOT_STEP_MINUTES;
++  if (
++    !isValidDateString(input.date) ||
++    !Number.isInteger(input.durationMinutes) ||
++    input.durationMinutes <= 0 ||
++    !Number.isInteger(step) ||
++    step <= 0
++  ) {
++    return [];
++  }
++
++  const weekday = weekdayOfDate(input.date);
++  const ranges = intersect(
++    windowsFor(input.businessWindows, weekday),
++    windowsFor(input.staffWindows, weekday),
++  );
++
++  const slots: BookableSlot[] = [];
++  const seen = new Set<number>();
++
++  for (const [rangeStart, rangeEnd] of ranges) {
++    for (
++      let minute = rangeStart;
++      minute + input.durationMinutes <= rangeEnd;
++      minute += step
++    ) {
++      if (seen.has(minute)) continue;
++      seen.add(minute);
++
++      const start = zonedMinuteToInstant(input.date, minute, input.timeZone);
++      const end = new Date(start.getTime() + input.durationMinutes * MINUTE_MS);
++
++      if (start.getTime() < input.now.getTime()) continue;
++      if (overlaps(start, end, input.blocked)) continue;
++
++      slots.push({
++        startsAt: start.toISOString(),
++        endsAt: end.toISOString(),
++        time: formatMinute(minute),
++      });
++    }
++  }
++
++  return slots;
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/booking-client.test.mjs ./apps/api/src/booking-client.test.mjs
+--- ../turnia-original/apps/api/src/booking-client.test.mjs	2026-10-31 20:41:48.706672906 +0000
++++ ./apps/api/src/booking-client.test.mjs	2026-10-31 20:49:18.877093902 +0000
+@@ -2,6 +2,7 @@
+ import {
+   bogotaLocalDateTimeToIso,
+   createApiBooking,
++  fetchAvailability,
+ } from "../../web/src/booking-api.ts";
+ 
+ const validBooking = {
+@@ -96,4 +97,50 @@
+       "formato inesperado",
+     );
+   });
++});
++
++describe("cliente de disponibilidad", () => {
++  const query = {
++    businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
++    serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
++    staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
++    date: "2026-10-26",
++  };
++  const slot = {
++    startsAt: "2026-10-26T13:00:00.000Z",
++    endsAt: "2026-10-26T13:30:00.000Z",
++    time: "08:00",
++  };
++
++  it("consulta los horarios con los parámetros en la URL", async () => {
++    const request = vi
++      .fn()
++      .mockResolvedValue(response({ data: { slots: [slot] } }, 200));
++    const slots = await fetchAvailability(query, request);
++    expect(slots).toEqual([slot]);
++    const url = request.mock.calls[0][0];
++    expect(url).toContain("/api/v1/availability?");
++    expect(url).toContain(`staffId=${query.staffId}`);
++    expect(url).toContain("date=2026-10-26");
++  });
++
++  it("propaga el mensaje de error de la API", async () => {
++    const request = vi
++      .fn()
++      .mockResolvedValue(
++        response({ error: { message: "Revisa la fecha" } }, 400),
++      );
++    await expect(fetchAvailability(query, request)).rejects.toThrow(
++      "Revisa la fecha",
++    );
++  });
++
++  it("rechaza horarios con formato inesperado", async () => {
++    const request = vi
++      .fn()
++      .mockResolvedValue(response({ data: { slots: [{ time: "8am" }] } }, 200));
++    await expect(fetchAvailability(query, request)).rejects.toThrow(
++      "formato inesperado",
++    );
++  });
+ });
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/rate-limit.test.ts ./apps/api/src/rate-limit.test.ts
+--- ../turnia-original/apps/api/src/rate-limit.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/rate-limit.test.ts	2026-10-31 20:46:39.237084412 +0000
+@@ -0,0 +1,33 @@
++import { describe, expect, it } from "vitest";
++import { createRateLimiter } from "./rate-limit.js";
++
++describe("createRateLimiter", () => {
++  it("permite hasta el máximo de intentos y bloquea el siguiente", () => {
++    const limiter = createRateLimiter({ maxAttempts: 3, windowMs: 1000 });
++    expect(limiter.hit("a", 0)).toBe(true);
++    expect(limiter.hit("a", 1)).toBe(true);
++    expect(limiter.hit("a", 2)).toBe(true);
++    expect(limiter.hit("a", 3)).toBe(false);
++  });
++
++  it("separa las claves entre sí", () => {
++    const limiter = createRateLimiter({ maxAttempts: 1, windowMs: 1000 });
++    expect(limiter.hit("a", 0)).toBe(true);
++    expect(limiter.hit("b", 0)).toBe(true);
++    expect(limiter.hit("a", 1)).toBe(false);
++  });
++
++  it("vuelve a permitir intentos cuando termina la ventana", () => {
++    const limiter = createRateLimiter({ maxAttempts: 1, windowMs: 1000 });
++    expect(limiter.hit("a", 0)).toBe(true);
++    expect(limiter.hit("a", 500)).toBe(false);
++    expect(limiter.hit("a", 2000)).toBe(true);
++  });
++
++  it("reset borra el historial de una clave", () => {
++    const limiter = createRateLimiter({ maxAttempts: 1, windowMs: 1000 });
++    expect(limiter.hit("a", 0)).toBe(true);
++    limiter.reset("a");
++    expect(limiter.hit("a", 1)).toBe(true);
++  });
++});
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/rate-limit.ts ./apps/api/src/rate-limit.ts
+--- ../turnia-original/apps/api/src/rate-limit.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/rate-limit.ts	2026-10-31 20:44:06.469075331 +0000
+@@ -0,0 +1,46 @@
++/**
++ * Limitador de intentos en memoria (ventana deslizante simple).
++ *
++ * Limitación conocida: el estado vive en el proceso, así que no se comparte
++ * entre varias instancias de la API. Para un despliegue con varias réplicas
++ * habrá que moverlo a Redis o a PostgreSQL.
++ */
++export type RateLimiter = {
++  /** Registra un intento y devuelve `true` si todavía está permitido. */
++  hit(key: string, now?: number): boolean;
++  reset(key: string): void;
++};
++
++export function createRateLimiter(options: {
++  maxAttempts: number;
++  windowMs: number;
++  maxKeys?: number;
++}): RateLimiter {
++  const attempts = new Map<string, number[]>();
++  const maxKeys = options.maxKeys ?? 10_000;
++
++  function prune(now: number) {
++    for (const [key, times] of attempts) {
++      const recent = times.filter((time) => now - time < options.windowMs);
++      if (recent.length === 0) attempts.delete(key);
++      else attempts.set(key, recent);
++    }
++  }
++
++  return {
++    hit(key, now = Date.now()) {
++      if (attempts.size >= maxKeys) prune(now);
++
++      const recent = (attempts.get(key) ?? []).filter(
++        (time) => now - time < options.windowMs,
++      );
++      recent.push(now);
++      attempts.set(key, recent);
++
++      return recent.length <= options.maxAttempts;
++    },
++    reset(key) {
++      attempts.delete(key);
++    },
++  };
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/api/src/session.ts ./apps/api/src/session.ts
+--- ../turnia-original/apps/api/src/session.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/api/src/session.ts	2026-10-31 20:48:55.645092521 +0000
+@@ -0,0 +1,152 @@
++import type { Request, Response } from "express";
++import type { MembershipRole } from "@prisma/client";
++import { prisma } from "./lib/prisma.js";
++import { hashSessionToken } from "./auth.js";
++
++export const SESSION_COOKIE = "turnia_session";
++export const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
++
++export function readSessionCookie(
++  cookieHeader: string | undefined,
++): string | null {
++  if (!cookieHeader) return null;
++
++  for (const part of cookieHeader.split(";")) {
++    const separator = part.indexOf("=");
++    if (separator < 0) continue;
++
++    const name = part.slice(0, separator).trim();
++    const value = part.slice(separator + 1).trim();
++
++    if (name === SESSION_COOKIE && /^[A-Za-z0-9_-]{43}$/.test(value)) {
++      return value;
++    }
++  }
++
++  return null;
++}
++
++function cookieAttributes(maxAgeSeconds: number): string[] {
++  const attributes = [
++    "Path=/",
++    "HttpOnly",
++    "SameSite=Lax",
++    `Max-Age=${maxAgeSeconds}`,
++  ];
++
++  if (process.env.NODE_ENV === "production") {
++    attributes.push("Secure");
++  }
++
++  return attributes;
++}
++
++export function sessionCookie(token: string, maxAgeSeconds: number): string {
++  return [
++    `${SESSION_COOKIE}=${token}`,
++    ...cookieAttributes(maxAgeSeconds),
++  ].join("; ");
++}
++
++export function clearedSessionCookie(): string {
++  return [`${SESSION_COOKIE}=`, ...cookieAttributes(0)].join("; ");
++}
++
++export type BusinessAccess = {
++  userId: string;
++  membershipId: string;
++  /** Solo se informa cuando la autorización se pidió con `allowedRoles`. */
++  role?: MembershipRole;
++};
++
++function reject(
++  response: Response,
++  status: number,
++  code: string,
++  message: string,
++): null {
++  response.status(status).json({ error: { code, message } });
++  return null;
++}
++
++/**
++ * Autorización del lado del servidor para recursos de un negocio.
++ *
++ * Exige una sesión válida (cookie HttpOnly con hash en base de datos) y una
++ * membresía del usuario en `businessId`. Si `allowedRoles` se indica, además
++ * restringe por rol. Si la solicitud no está autorizada responde 401/403 y
++ * devuelve `null`; el llamador debe terminar sin hacer más trabajo.
++ */
++export async function authorizeBusinessAccess(
++  request: Request,
++  response: Response,
++  businessId: string,
++  allowedRoles?: readonly MembershipRole[],
++): Promise<BusinessAccess | null> {
++  const token = readSessionCookie(request.headers.cookie);
++
++  if (!token) {
++    return reject(response, 401, "UNAUTHENTICATED", "Debes iniciar sesión.");
++  }
++
++  const session = await prisma.session.findFirst({
++    where: {
++      tokenHash: hashSessionToken(token),
++      revokedAt: null,
++      expiresAt: { gt: new Date() },
++    },
++    select: {
++      user: {
++        select: {
++          id: true,
++          active: true,
++        },
++      },
++    },
++  });
++
++  if (!session || !session.user.active) {
++    return reject(
++      response,
++      401,
++      "UNAUTHENTICATED",
++      "La sesión no es válida o ha expirado.",
++    );
++  }
++
++  const forbidden = () =>
++    reject(
++      response,
++      403,
++      "FORBIDDEN",
++      "No tienes permiso para realizar esta acción en este negocio.",
++    );
++
++  // Sin restricción de rol solo se consulta la existencia de la membresía;
++  // con roles permitidos también se devuelve el rol para el llamador.
++  if (allowedRoles) {
++    const membership = await prisma.membership.findFirst({
++      where: {
++        businessId,
++        userId: session.user.id,
++        role: { in: [...allowedRoles] },
++      },
++      select: { id: true, role: true },
++    });
++    if (!membership) return forbidden();
++
++    return {
++      userId: session.user.id,
++      membershipId: membership.id,
++      role: membership.role,
++    };
++  }
++
++  const membership = await prisma.membership.findFirst({
++    where: { businessId, userId: session.user.id },
++    select: { id: true },
++  });
++  if (!membership) return forbidden();
++
++  return { userId: session.user.id, membershipId: membership.id };
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/App.tsx ./apps/web/src/App.tsx
+--- ../turnia-original/apps/web/src/App.tsx	2026-10-31 20:41:48.707245700 +0000
++++ ./apps/web/src/App.tsx	2026-10-31 20:48:19.349090363 +0000
+@@ -1,5 +1,9 @@
+ import { useEffect, useMemo, useRef, useState } from "react";
+-import { bogotaLocalDateTimeToIso, createApiBooking } from "./booking-api.js";
++import {
++  createApiBooking,
++  fetchAvailability,
++  type AvailabilitySlot,
++} from "./booking-api.js";
+ import {
+   Activity,
+   ArrowRight,
+@@ -11,6 +15,7 @@
+   ClipboardList,
+   HeartHandshake,
+   LayoutDashboard,
++  LogOut,
+   Menu,
+   Plus,
+   Search,
+@@ -101,7 +106,6 @@
+ }
+ 
+ type DataSource = "demo" | "api";
+-const BUSINESS_ID = "758ad131-14b1-42e4-8d74-d093bb62c41b";
+ const BOGOTA_TIME_ZONE = "America/Bogota";
+ const apiStatusLabels: Record<ApiBooking["status"], Status> = {
+   PENDING: "Pendiente",
+@@ -232,7 +236,32 @@
+   );
+ }
+ 
+-export default function App() {
++type AppProps = {
++  businessId: string;
++  businessName: string;
++  user: { id: string; email: string; fullName: string };
++  onLogout: () => void;
++  onSessionExpired: () => void;
++};
++
++function initialsOf(fullName: string) {
++  const letters = fullName
++    .trim()
++    .split(/\s+/)
++    .filter(Boolean)
++    .slice(0, 2)
++    .map((word) => word.charAt(0).toUpperCase())
++    .join("");
++  return letters || "?";
++}
++
++export default function App({
++  businessId,
++  businessName,
++  user,
++  onLogout,
++  onSessionExpired,
++}: AppProps) {
+   const [page, setPage] = useState<Page>("Inicio");
+   const [appointments, setAppointments] = useState<Appointment[]>([]);
+   const [dataSource, setDataSource] = useState<DataSource>("api");
+@@ -244,6 +273,9 @@
+   );
+   const [catalogError, setCatalogError] = useState("");
+   const [catalogReloadKey, setCatalogReloadKey] = useState(0);
++  const [slots, setSlots] = useState<AvailabilitySlot[] | null>(null);
++  const [slotsError, setSlotsError] = useState("");
++  const [slotsReloadKey, setSlotsReloadKey] = useState(0);
+   const [isSubmitting, setIsSubmitting] = useState(false);
+   const submissionGuard = useRef(false);
+   const [createError, setCreateError] = useState("");
+@@ -270,9 +302,13 @@
+       setBookingLoadError("");
+       try {
+         const response = await fetch(
+-          `/api/v1/bookings?businessId=${encodeURIComponent(BUSINESS_ID)}`,
++          `/api/v1/bookings?businessId=${encodeURIComponent(businessId)}`,
+           { signal: controller.signal },
+         );
++        if (response.status === 401) {
++          onSessionExpired();
++          return;
++        }
+         if (!response.ok)
+           throw new Error(`La API respondió con el código ${response.status}.`);
+         const payload: unknown = await response.json();
+@@ -296,14 +332,14 @@
+     }
+     void loadBookings();
+     return () => controller.abort();
+-  }, [reloadKey]);
++  }, [reloadKey, businessId, onSessionExpired]);
+   useEffect(() => {
+     const controller = new AbortController();
+     async function loadCatalog() {
+       setCatalogError("");
+       try {
+         const response = await fetch(
+-          `/api/v1/catalog?businessId=${encodeURIComponent(BUSINESS_ID)}`,
++          `/api/v1/catalog?businessId=${encodeURIComponent(businessId)}`,
+           { signal: controller.signal },
+         );
+         if (!response.ok)
+@@ -324,7 +360,7 @@
+     }
+     void loadCatalog();
+     return () => controller.abort();
+-  }, [catalogReloadKey]);
++  }, [catalogReloadKey, businessId]);
+ 
+   useEffect(() => {
+     if (!catalog || catalog.services.length === 0) return;
+@@ -344,6 +380,60 @@
+       };
+     });
+   }, [catalog]);
++  // Horarios libres calculados por el servidor para el servicio, el empleado
++  // y la fecha elegidos en el formulario.
++  useEffect(() => {
++    if (
++      !showModal ||
++      dataSource !== "api" ||
++      !form.serviceId ||
++      !form.staffId ||
++      !form.date
++    ) {
++      setSlots(null);
++      setSlotsError("");
++      return;
++    }
++    const controller = new AbortController();
++    setSlots(null);
++    setSlotsError("");
++    fetchAvailability(
++      {
++        businessId,
++        serviceId: form.serviceId,
++        staffId: form.staffId,
++        date: form.date,
++      },
++      fetch,
++      controller.signal,
++    )
++      .then((available) => {
++        setSlots(available);
++        setForm((current) =>
++          available.some((slot) => slot.time === current.time)
++            ? current
++            : { ...current, time: available[0]?.time ?? "" },
++        );
++      })
++      .catch((error: unknown) => {
++        if (controller.signal.aborted) return;
++        setSlots([]);
++        setSlotsError(
++          error instanceof Error
++            ? error.message
++            : "No fue posible consultar los horarios.",
++        );
++      });
++    return () => controller.abort();
++  }, [
++    showModal,
++    dataSource,
++    businessId,
++    form.serviceId,
++    form.staffId,
++    form.date,
++    slotsReloadKey,
++  ]);
+   const filteredAppointments = useMemo(
+     () =>
+       appointments.filter((item) =>
+@@ -431,7 +521,8 @@
+     }
+ 
+     if (submissionGuard.current) return;
+-    const startsAt = bogotaLocalDateTimeToIso(form.date, form.time);
++    const selectedSlot = slots?.find((slot) => slot.time === form.time);
++    const startsAt = selectedSlot?.startsAt ?? null;
+     const service = catalog?.services.find(
+       (item) => item.id === form.serviceId,
+     );
+@@ -447,7 +538,7 @@
+     }
+     if (!startsAt) {
+       setCreateError(
+-        "La fecha y hora no son válidas para la zona horaria de Bogotá.",
++        "Selecciona uno de los horarios disponibles para esa fecha.",
+       );
+       return;
+     }
+@@ -456,7 +547,7 @@
+     setIsSubmitting(true);
+     try {
+       const created = await createApiBooking({
+-        businessId: BUSINESS_ID,
++        businessId,
+         serviceId: service.id,
+         staffId: form.staffId,
+         startsAt,
+@@ -486,6 +577,8 @@
+       setNotice("Reserva creada y confirmada por la API.");
+       setReloadKey((key) => key + 1);
+     } catch (error) {
++      // El horario pudo ocuparse mientras el formulario estaba abierto.
++      setSlotsReloadKey((key) => key + 1);
+       setCreateError(
+         error instanceof TypeError
+           ? "No fue posible conectar con la API. Revisa que el servidor esté iniciado e inténtalo de nuevo."
+@@ -576,18 +669,29 @@
+             <p>Organiza las citas y acompaña cada proceso.</p>
+           </div>
+           <div className="profile">
+-            <div className="profile-avatar">AD</div>
++            <div className="profile-avatar" aria-hidden="true">
++              {initialsOf(user.fullName)}
++            </div>
+             <div className="profile-copy">
+-              <strong>Administrador</strong>
+-              <span>Equipo Turnia</span>
++              <strong>{user.fullName}</strong>
++              <span>{businessName}</span>
+             </div>
+             <button
+               className="icon-button"
+               title="Configuración"
++              aria-label="Configuración"
+               onClick={() => setPage("Configuración")}
+             >
+               <Settings size={17} />
+             </button>
++            <button
++              className="icon-button"
++              title="Cerrar sesión"
++              aria-label="Cerrar sesión"
++              onClick={onLogout}
++            >
++              <LogOut size={17} />
++            </button>
+           </div>
+         </div>
+       </aside>
+@@ -618,7 +722,9 @@
+               <Bell size={19} />
+               <i />
+             </button>
+-            <div className="top-avatar">AD</div>
++            <div className="top-avatar" aria-hidden="true">
++              {initialsOf(user.fullName)}
++            </div>
+           </div>
+         </header>
+ 
+@@ -1364,16 +1470,63 @@
+                     onChange={(e) => setForm({ ...form, date: e.target.value })}
+                   />
+                 </label>
+-                <label>
+-                  Hora (Bogotá)
+-                  <input
+-                    required
+-                    type="time"
+-                    value={form.time}
+-                    onChange={(e) => setForm({ ...form, time: e.target.value })}
+-                  />
+-                </label>
++                {dataSource === "api" ? (
++                  <label>
++                    Hora disponible
++                    <select
++                      required
++                      value={form.time}
++                      disabled={!slots || slots.length === 0}
++                      onChange={(e) =>
++                        setForm({ ...form, time: e.target.value })
++                      }
++                    >
++                      {slots === null && !slotsError && (
++                        <option value="">Consultando horarios…</option>
++                      )}
++                      {slots?.length === 0 && (
++                        <option value="">Sin horarios disponibles</option>
++                      )}
++                      {slots?.map((slot) => (
++                        <option key={slot.startsAt} value={slot.time}>
++                          {slot.time}
++                        </option>
++                      ))}
++                    </select>
++                  </label>
++                ) : (
++                  <label>
++                    Hora (Bogotá)
++                    <input
++                      required
++                      type="time"
++                      value={form.time}
++                      onChange={(e) =>
++                        setForm({ ...form, time: e.target.value })
++                      }
++                    />
++                  </label>
++                )}
+               </div>
++              {dataSource === "api" && slotsError && (
++                <div className="notice" role="alert">
++                  <CircleAlert size={17} />
++                  <span>{slotsError}</span>
++                  <button
++                    type="button"
++                    className="text-button"
++                    onClick={() => setSlotsReloadKey((key) => key + 1)}
++                  >
++                    Reintentar
++                  </button>
++                </div>
++              )}
++              {dataSource === "api" && slots?.length === 0 && !slotsError && (
++                <p className="field-hint" role="status">
++                  No hay horarios libres para esa fecha. Prueba con otro día u
++                  otro empleado.
++                </p>
++              )}
+               {dataSource === "api" && (
+                 <label>
+                   Notas (opcional)
+@@ -1391,7 +1544,7 @@
+                 <CircleAlert size={17} />
+                 <span>
+                   {dataSource === "api"
+-                    ? "La duración se toma del servicio y el horario se envía en la zona America/Bogota."
++                    ? "La duración se toma del servicio. Solo se ofrecen horarios libres según la agenda del negocio y del empleado."
+                     : "Esta cita solo se guarda en el estado temporal de la página, no en PostgreSQL."}
+                 </span>
+               </div>
+@@ -1411,6 +1564,9 @@
+                     isSubmitting ||
+                     (dataSource === "api" &&
+                       (isLoadingBookings ||
++                        !slots ||
++                        slots.length === 0 ||
++                        !form.time ||
+                         !catalog ||
+                         !selectedCatalogService ||
+                         selectedCatalogService.staff.length === 0))
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/AuthGate.tsx ./apps/web/src/AuthGate.tsx
+--- ../turnia-original/apps/web/src/AuthGate.tsx	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/web/src/AuthGate.tsx	2026-10-31 20:48:55.769092528 +0000
+@@ -0,0 +1,130 @@
++import { useCallback, useEffect, useState } from "react";
++import App from "./App";
++import LoginScreen from "./LoginScreen";
++import { fetchSession, logoutRequest, type SessionInfo } from "./auth-api.js";
++
++type GateState =
++  | { status: "loading" }
++  | { status: "anonymous" }
++  | { status: "error"; message: string }
++  | { status: "ready"; session: SessionInfo };
++
++/**
++ * Decide qué mostrar según la sesión del servidor: pantalla de acceso,
++ * panel o un mensaje cuando la cuenta no pertenece a ningún negocio.
++ * La autorización real siempre ocurre en la API; esto solo evita mostrar un
++ * panel que no podría cargar datos.
++ */
++export default function AuthGate() {
++  const [state, setState] = useState<GateState>({ status: "loading" });
++  const [attempt, setAttempt] = useState(0);
++
++  useEffect(() => {
++    let cancelled = false;
++    setState({ status: "loading" });
++    fetchSession()
++      .then((session) => {
++        if (cancelled) return;
++        setState(
++          session ? { status: "ready", session } : { status: "anonymous" },
++        );
++      })
++      .catch((error: unknown) => {
++        if (cancelled) return;
++        setState({
++          status: "error",
++          message:
++            error instanceof TypeError
++              ? "No fue posible conectar con la API. Revisa que el servidor esté iniciado."
++              : error instanceof Error
++                ? error.message
++                : "No se pudo verificar la sesión.",
++        });
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [attempt]);
++
++  const handleLogout = useCallback(async () => {
++    try {
++      await logoutRequest();
++    } catch {
++      // Aun si la red falla, se vuelve a la pantalla de acceso; la sesión
++      // del servidor expira sola y la cookie se renovará al iniciar de nuevo.
++    }
++    setState({ status: "anonymous" });
++  }, []);
++
++  const handleSessionExpired = useCallback(() => {
++    setState({ status: "anonymous" });
++  }, []);
++
++  if (state.status === "loading") {
++    return (
++      <main className="login-page">
++        <p role="status" className="login-status">
++          Verificando la sesión…
++        </p>
++      </main>
++    );
++  }
++
++  if (state.status === "error") {
++    return (
++      <main className="login-page">
++        <section className="login-card" role="alert">
++          <h1>No se pudo cargar Turnia</h1>
++          <p className="login-subtitle">{state.message}</p>
++          <button
++            type="button"
++            className="primary-button login-submit"
++            onClick={() => setAttempt((value) => value + 1)}
++          >
++            Reintentar
++          </button>
++        </section>
++      </main>
++    );
++  }
++
++  if (state.status === "anonymous") {
++    return (
++      <LoginScreen
++        onAuthenticated={(session) => setState({ status: "ready", session })}
++      />
++    );
++  }
++
++  const membership = state.session.memberships[0];
++  if (!membership) {
++    return (
++      <main className="login-page">
++        <section className="login-card" role="alert">
++          <h1>Tu cuenta no tiene acceso a ningún negocio</h1>
++          <p className="login-subtitle">
++            Pide a un administrador que te agregue a un negocio para poder ver y
++            gestionar su agenda.
++          </p>
++          <button
++            type="button"
++            className="secondary-button login-submit"
++            onClick={() => void handleLogout()}
++          >
++            Cerrar sesión
++          </button>
++        </section>
++      </main>
++    );
++  }
++
++  return (
++    <App
++      businessId={membership.businessId}
++      businessName={membership.businessName}
++      user={state.session.user}
++      onLogout={() => void handleLogout()}
++      onSessionExpired={handleSessionExpired}
++    />
++  );
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/LoginScreen.tsx ./apps/web/src/LoginScreen.tsx
+--- ../turnia-original/apps/web/src/LoginScreen.tsx	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/web/src/LoginScreen.tsx	2026-10-31 20:47:46.827990527 +0000
+@@ -0,0 +1,109 @@
++import { useState } from "react";
++import { CalendarDays, CircleAlert, LogIn } from "lucide-react";
++import { fetchSession, loginRequest, type SessionInfo } from "./auth-api.js";
++
++type LoginScreenProps = {
++  onAuthenticated: (session: SessionInfo) => void;
++};
++
++export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++  const [error, setError] = useState("");
++  const [isSubmitting, setIsSubmitting] = useState(false);
++
++  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (isSubmitting) return;
++    setError("");
++
++    if (!email.trim() || !password) {
++      setError("Escribe tu correo y tu contraseña.");
++      return;
++    }
++
++    setIsSubmitting(true);
++    try {
++      await loginRequest(email.trim(), password);
++      const session = await fetchSession();
++      if (!session) {
++        throw new Error(
++          "La sesión no se pudo establecer. Revisa que el navegador acepte cookies.",
++        );
++      }
++      setPassword("");
++      onAuthenticated(session);
++    } catch (caught) {
++      setError(
++        caught instanceof TypeError
++          ? "No fue posible conectar con la API. Revisa que el servidor esté iniciado."
++          : caught instanceof Error
++            ? caught.message
++            : "No se pudo iniciar sesión. Inténtalo de nuevo.",
++      );
++    } finally {
++      setIsSubmitting(false);
++    }
++  }
++
++  return (
++    <main className="login-page">
++      <section className="login-card" aria-labelledby="login-title">
++        <div className="login-brand">
++          <span className="brand-mark" aria-hidden="true">
++            <CalendarDays size={22} />
++          </span>
++          <strong>Turnia</strong>
++        </div>
++        <h1 id="login-title">Inicia sesión</h1>
++        <p className="login-subtitle">
++          Accede al panel para gestionar la agenda de tu negocio.
++        </p>
++
++        {error && (
++          <div className="login-error" role="alert">
++            <CircleAlert size={17} aria-hidden="true" />
++            <span>{error}</span>
++          </div>
++        )}
++
++        <form onSubmit={handleSubmit} noValidate>
++          <label>
++            Correo electrónico
++            <input
++              type="email"
++              name="email"
++              autoComplete="username"
++              maxLength={254}
++              required
++              autoFocus
++              value={email}
++              onChange={(event) => setEmail(event.target.value)}
++              placeholder="tu@negocio.com"
++            />
++          </label>
++          <label>
++            Contraseña
++            <input
++              type="password"
++              name="password"
++              autoComplete="current-password"
++              maxLength={1024}
++              required
++              value={password}
++              onChange={(event) => setPassword(event.target.value)}
++            />
++          </label>
++          <button
++            type="submit"
++            className="primary-button login-submit"
++            disabled={isSubmitting}
++          >
++            <LogIn size={17} aria-hidden="true" />{" "}
++            {isSubmitting ? "Ingresando…" : "Ingresar"}
++          </button>
++        </form>
++      </section>
++    </main>
++  );
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/auth-api.ts ./apps/web/src/auth-api.ts
+--- ../turnia-original/apps/web/src/auth-api.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./apps/web/src/auth-api.ts	2026-10-31 20:47:31.868350092 +0000
+@@ -0,0 +1,132 @@
++export type MembershipRole = "OWNER" | "ADMIN" | "STAFF";
++
++export type SessionMembership = {
++  businessId: string;
++  businessName: string;
++  businessSlug: string;
++  timezone: string;
++  role: MembershipRole;
++};
++
++export type SessionInfo = {
++  user: { id: string; email: string; fullName: string };
++  memberships: SessionMembership[];
++};
++
++const roles: readonly string[] = ["OWNER", "ADMIN", "STAFF"];
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function parseMembership(value: unknown): SessionMembership | null {
++  if (!isRecord(value)) return null;
++  const { businessId, businessName, businessSlug, timezone, role } = value;
++  if (
++    typeof businessId !== "string" ||
++    typeof businessName !== "string" ||
++    typeof businessSlug !== "string" ||
++    typeof timezone !== "string" ||
++    typeof role !== "string" ||
++    !roles.includes(role)
++  ) {
++    return null;
++  }
++  return {
++    businessId,
++    businessName,
++    businessSlug,
++    timezone,
++    role: role as MembershipRole,
++  };
++}
++
++export function parseSessionInfo(body: unknown): SessionInfo | null {
++  if (!isRecord(body) || !isRecord(body.data)) return null;
++  const { user, memberships } = body.data;
++  if (
++    !isRecord(user) ||
++    typeof user.id !== "string" ||
++    typeof user.email !== "string" ||
++    typeof user.fullName !== "string" ||
++    !Array.isArray(memberships)
++  ) {
++    return null;
++  }
++  const parsed = memberships.map(parseMembership);
++  if (parsed.some((item) => item === null)) return null;
++  return {
++    user: { id: user.id, email: user.email, fullName: user.fullName },
++    memberships: parsed as SessionMembership[],
++  };
++}
++
++async function readJson(response: Response): Promise<unknown> {
++  try {
++    return await response.json();
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Consulta la sesión actual. Devuelve `null` cuando no hay sesión válida
++ * (HTTP 401) y lanza un error ante cualquier otro fallo.
++ */
++export async function fetchSession(
++  request: typeof fetch = fetch,
++): Promise<SessionInfo | null> {
++  const response = await request("/api/v1/auth/me", {
++    headers: { Accept: "application/json" },
++  });
++  if (response.status === 401) return null;
++  if (!response.ok) {
++    throw new Error(
++      `No se pudo verificar la sesión (código ${response.status}).`,
++    );
++  }
++  const session = parseSessionInfo(await readJson(response));
++  if (!session) {
++    throw new Error("El servidor respondió con un formato inesperado.");
++  }
++  return session;
++}
++
++/** Inicia sesión. La API establece la cookie HttpOnly de sesión. */
++export async function loginRequest(
++  email: string,
++  password: string,
++  request: typeof fetch = fetch,
++): Promise<void> {
++  const response = await request("/api/v1/auth/login", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ email, password }),
++  });
++  if (response.ok) return;
++
++  const body = await readJson(response);
++  const apiMessage =
++    isRecord(body) &&
++    isRecord(body.error) &&
++    typeof body.error.message === "string"
++      ? body.error.message
++      : null;
++
++  if (response.status === 401) {
++    throw new Error("Correo o contraseña incorrectos.");
++  }
++  if (response.status === 429 || response.status === 400) {
++    throw new Error(
++      apiMessage ?? "No se pudo iniciar sesión. Revisa los datos.",
++    );
++  }
++  throw new Error("No se pudo iniciar sesión. Inténtalo de nuevo.");
++}
++
++/** Cierra la sesión en el servidor (revoca el token y limpia la cookie). */
++export async function logoutRequest(
++  request: typeof fetch = fetch,
++): Promise<void> {
++  await request("/api/v1/auth/logout", { method: "POST" });
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/booking-api.ts ./apps/web/src/booking-api.ts
+--- ../turnia-original/apps/web/src/booking-api.ts	2026-10-31 20:41:48.707433875 +0000
++++ ./apps/web/src/booking-api.ts	2026-10-31 20:47:31.879636680 +0000
+@@ -90,3 +90,75 @@
+   }
+   return responseBody.data;
+ }
++
++export type AvailabilitySlot = {
++  startsAt: string;
++  endsAt: string;
++  /** Hora local del negocio, HH:MM. */
++  time: string;
++};
++
++export type AvailabilityQuery = {
++  businessId: string;
++  serviceId: string;
++  staffId: string;
++  /** Fecha local del negocio, AAAA-MM-DD. */
++  date: string;
++};
++
++function isAvailabilitySlot(value: unknown): value is AvailabilitySlot {
++  if (typeof value !== "object" || value === null) return false;
++  const slot = value as Record<string, unknown>;
++  return (
++    typeof slot.startsAt === "string" &&
++    Number.isFinite(Date.parse(slot.startsAt)) &&
++    typeof slot.endsAt === "string" &&
++    Number.isFinite(Date.parse(slot.endsAt)) &&
++    typeof slot.time === "string" &&
++    /^\d{2}:\d{2}$/.test(slot.time)
++  );
++}
++
++/** Consulta los horarios libres que calcula el servidor para una fecha. */
++export async function fetchAvailability(
++  query: AvailabilityQuery,
++  request: typeof fetch = fetch,
++  signal?: AbortSignal,
++): Promise<AvailabilitySlot[]> {
++  const params = new URLSearchParams(query);
++  const response = await request(`/api/v1/availability?${params.toString()}`, {
++    ...(signal ? { signal } : {}),
++    headers: { Accept: "application/json" },
++  });
++
++  let body: unknown = null;
++  try {
++    body = await response.json();
++  } catch {
++    // Se trata como respuesta inesperada más abajo.
++  }
++
++  if (!response.ok) {
++    const message =
++      typeof body === "object" &&
++      body !== null &&
++      typeof (body as { error?: { message?: unknown } }).error?.message ===
++        "string"
++        ? (body as { error: { message: string } }).error.message
++        : `No se pudieron consultar los horarios (código ${response.status}).`;
++    throw new Error(message);
++  }
++
++  const data =
++    typeof body === "object" && body !== null
++      ? (body as { data?: unknown }).data
++      : null;
++  const slots =
++    typeof data === "object" && data !== null
++      ? (data as { slots?: unknown }).slots
++      : null;
++  if (!Array.isArray(slots) || !slots.every(isAvailabilitySlot)) {
++    throw new Error("El servidor devolvió horarios con un formato inesperado.");
++  }
++  return slots;
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/main.tsx ./apps/web/src/main.tsx
+--- ../turnia-original/apps/web/src/main.tsx	2026-10-31 20:41:48.707445873 +0000
++++ ./apps/web/src/main.tsx	2026-10-31 20:47:46.839709413 +0000
+@@ -1,10 +1,10 @@
+ import React from "react";
+ import ReactDOM from "react-dom/client";
+-import App from "./App";
++import AuthGate from "./AuthGate";
+ import "./styles.css";
+ 
+ ReactDOM.createRoot(document.getElementById("root")!).render(
+   <React.StrictMode>
+-    <App />
++    <AuthGate />
+   </React.StrictMode>,
+ );
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/src/styles.css ./apps/web/src/styles.css
+--- ../turnia-original/apps/web/src/styles.css	2026-10-31 20:41:48.707455476 +0000
++++ ./apps/web/src/styles.css	2026-10-31 20:48:19.353090363 +0000
+@@ -1574,3 +1574,80 @@
+     padding: 19px;
+   }
+ }
++
++/* ---------- Acceso (login) ---------- */
++.login-page {
++  min-height: 100vh;
++  display: grid;
++  place-items: center;
++  padding: 24px;
++  background: linear-gradient(160deg, var(--cream), #fffaf7 60%);
++}
++.login-card {
++  width: min(100%, 420px);
++  background: var(--surface);
++  border: 1px solid var(--line);
++  border-radius: 20px;
++  padding: 32px 28px;
++  box-shadow: 0 18px 50px rgba(156, 43, 27, 0.08);
++}
++.login-brand {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 20px;
++  color: var(--deep-red);
++}
++.login-card h1 {
++  margin: 0 0 6px;
++  font-size: 1.6rem;
++  line-height: 1.2;
++}
++.login-subtitle {
++  margin: 0 0 20px;
++  color: var(--muted);
++  line-height: 1.5;
++}
++.login-card form {
++  display: grid;
++  gap: 14px;
++}
++.login-card label {
++  display: grid;
++  gap: 6px;
++  font-weight: 600;
++  font-size: 0.9rem;
++}
++.login-card input {
++  min-height: 44px;
++  padding: 10px 12px;
++  border: 1px solid var(--line);
++  border-radius: 12px;
++  background: #fff;
++  color: var(--ink);
++}
++.login-submit {
++  width: 100%;
++  justify-content: center;
++  min-height: 46px;
++  margin-top: 4px;
++}
++.login-error {
++  display: flex;
++  align-items: flex-start;
++  gap: 8px;
++  margin-bottom: 14px;
++  padding: 10px 12px;
++  border-radius: 12px;
++  background: #fff1ee;
++  color: var(--deep-red);
++  font-size: 0.92rem;
++}
++.login-status {
++  color: var(--muted);
++}
++.field-hint {
++  margin: 0;
++  color: var(--muted);
++  font-size: 0.9rem;
++}
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/apps/web/tsconfig.json ./apps/web/tsconfig.json
+--- ../turnia-original/apps/web/tsconfig.json	2026-10-31 20:41:48.707568146 +0000
++++ ./apps/web/tsconfig.json	2026-10-31 20:48:56.381092564 +0000
+@@ -8,5 +8,6 @@
+     "types": ["vite/client"],
+     "noEmit": true
+   },
+-  "include": ["src", "vite.config.ts"]
++  "include": ["src", "vite.config.ts"],
++  "exclude": ["src/**/*.backup.tsx", "src/**/App.backup.tsx"]
+ }
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/docs/architecture.md ./docs/architecture.md
+--- ../turnia-original/docs/architecture.md	2026-10-31 20:41:48.707662999 +0000
++++ ./docs/architecture.md	2026-10-31 20:52:09.995068980 +0000
+@@ -7,14 +7,14 @@
+ - `apps/web`: interfaz React con Vite y TypeScript. Tailwind CSS v4 ya está integrado; `components.json` y los alias previstos dejan preparada la incorporación gradual de shadcn/ui. Vite carga las variables desde la raíz, escucha en loopback y reenvía `/api` a Express.
+ - `apps/api`: servidor Express en TypeScript. `src/app.ts` define la aplicación para poder probarla sin abrir un puerto; `src/server.ts` carga `.env` de la raíz e inicia el servidor. Incluye health check, respuestas JSON de error y 404.
+ - `packages/shared`: tipos y utilidades sin dependencia de la interfaz ni del servidor, consumibles por ambas aplicaciones.
+-- `prisma`: esquema inicial PostgreSQL sin modelos de negocio y configuración del CLI.
++- `prisma`: esquema PostgreSQL con modelos de negocio, migraciones SQL y datos de demostración (`seed.ts`).
+ - `docs`: documentación técnica y plan por fases.
+ 
+ ## Datos y configuración
+ 
+ Docker Compose inicia PostgreSQL 17 enlazado solo a `127.0.0.1`, en el puerto configurado por `POSTGRES_PORT`, y conserva datos en un volumen nombrado. `.env.example` documenta la URL de Prisma, puertos y credenciales de desarrollo; los archivos `.env` quedan fuera de Git. Los valores de ejemplo no son secretos ni adecuados para despliegue.
+ 
+-Prisma 6 se configura con `prisma/schema.prisma`. Los scripts `prisma:validate` y `prisma:generate` validan el esquema y generan el cliente. pnpm 10.12.1 permite scripts de instalación solo para Prisma, sus motores y el cliente. Esta fase no crea migraciones ni modelos. La API tampoco se conecta todavía a la base de datos.
++Prisma 6 se configura con `prisma/schema.prisma`. Los scripts `prisma:validate` y `prisma:generate` validan el esquema y generan el cliente. pnpm 10.12.1 permite scripts de instalación solo para Prisma, sus motores y el cliente. La API se conecta a PostgreSQL mediante Prisma Client (`apps/api/src/lib/prisma.ts`). Las reglas de integridad que Prisma no expresa (exclusión de reservas solapadas, comprobaciones de rangos) se definen en migraciones SQL.
+ 
+ ## Calidad y comandos
+ 
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/docs/etapa-1-agenda-segura.md ./docs/etapa-1-agenda-segura.md
+--- ../turnia-original/docs/etapa-1-agenda-segura.md	1970-01-01 00:00:00.000000000 +0000
++++ ./docs/etapa-1-agenda-segura.md	2026-10-31 20:52:10.421104099 +0000
+@@ -0,0 +1,71 @@
++# Etapa 1: agenda segura y acceso
++
++Documenta las reglas que implementa el servidor para reservar. La fuente de
++verdad son el código (`apps/api/src/availability.ts`, `session.ts`, `app.ts`) y
++las migraciones SQL; este documento resume las convenciones.
++
++## Quién puede qué
++
++| Recurso                    | Acceso                                                 |
++| -------------------------- | ------------------------------------------------------ |
++| `GET /api/v1/catalog`      | Público (servicios y empleados activos)                |
++| `GET /api/v1/availability` | Público (solo intervalos libres, sin clientes)         |
++| `GET /api/v1/bookings`     | Sesión + membresía en el negocio                       |
++| `POST /api/v1/bookings`    | Sesión + membresía en el negocio (origen PANEL)        |
++| `GET /api/v1/auth/me`      | Sesión; devuelve usuario y negocios con su rol         |
++| `POST /api/v1/auth/login`  | Público, limitado a 10 intentos / 15 min (correo + IP) |
++
++La autorización ocurre en el servidor (`authorizeBusinessAccess`). El frontend
++solo decide qué pantalla mostrar. Las sesiones usan una cookie `HttpOnly`,
++`SameSite=Lax` (y `Secure` en producción); en base de datos solo se guarda el
++hash SHA-256 del token.
++
++## Convenciones de agenda
++
++- `weekday`: 0 = domingo ... 6 = sábado.
++- `startMinute` / `endMinute`: minutos desde las 00:00 en la zona horaria del
++  negocio; `endMinute` exclusivo y máximo 1440.
++- Los intervalos son semiabiertos `[inicio, fin)`: una cita que termina a las
++  10:30 no choca con otra que empieza a las 10:30.
++- Una hora es reservable solo si cabe dentro del horario del negocio **y** del
++  horario del empleado ese día. Un empleado sin horarios configurados no
++  ofrece disponibilidad.
++- Se rechazan: horas pasadas, horas con segundos, cierres del negocio y
++  ausencias del empleado (`422 SLOT_UNAVAILABLE` con `details.reason`).
++
++## Reservas simultáneas
++
++El servidor valida agenda antes de insertar, pero **la garantía contra dobles
++reservas la da PostgreSQL**: la restricción de exclusión
++`booking_staff_no_overlapping_active` impide dos reservas activas
++(`PENDING`/`CONFIRMED`) que se solapen para el mismo empleado. El conflicto se
++traduce a `409 BOOKING_CONFLICT`. Las reservas `CANCELLED`, `COMPLETED`,
++`NO_SHOW` y `EXPIRED` no bloquean el horario.
++
++## Migración `20261031150000_schedule_integrity_checks`
++
++Añade restricciones `CHECK` (no destructivas). Antes de aplicarla, comprueba en
++pgAdmin que ninguna fila existente las incumple; cada consulta debe devolver 0:
++
++```sql
++SELECT count(*) FROM "BusinessHours"
++ WHERE NOT ("weekday" BETWEEN 0 AND 6 AND "startMinute" >= 0
++            AND "endMinute" <= 1440 AND "startMinute" < "endMinute");
++SELECT count(*) FROM "StaffAvailability"
++ WHERE NOT ("weekday" BETWEEN 0 AND 6 AND "startMinute" >= 0
++            AND "endMinute" <= 1440 AND "startMinute" < "endMinute");
++SELECT count(*) FROM "BusinessClosure" WHERE NOT ("startsAt" < "endsAt");
++SELECT count(*) FROM "TimeOff"         WHERE NOT ("startsAt" < "endsAt");
++SELECT count(*) FROM "Booking"         WHERE NOT ("startsAt" < "endsAt");
++SELECT count(*) FROM "Service"         WHERE NOT ("durationMinutes" > 0 AND "price" >= 0);
++```
++
++## Limitaciones conocidas de esta etapa
++
++- El limitador de intentos de login vive en memoria del proceso (no se comparte
++  entre réplicas).
++- No existe aún registro de usuarios, recuperación de contraseña, rol de
++  cliente ni gestión de horarios desde la interfaz (se cargan por seed o SQL).
++- Las reservas `PENDING` con `holdExpiresAt` vencido todavía no se expiran
++  automáticamente (no hay tarea programada).
++- El panel usa el primer negocio de la cuenta; falta selector de negocio.
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/package.json ./package.json
+--- ../turnia-original/package.json	2026-10-31 20:41:48.707805495 +0000
++++ ./package.json	2026-10-31 20:49:51.738846449 +0000
+@@ -16,7 +16,8 @@
+     "test": "pnpm --filter @turnia/api test",
+     "typecheck": "pnpm -r typecheck",
+     "prisma:validate": "prisma validate",
+-    "prisma:generate": "prisma generate"
++    "prisma:generate": "prisma generate",
++    "db:seed": "pnpm --filter @turnia/api exec tsx ../../prisma/seed.ts"
+   },
+   "devDependencies": {
+     "@prisma/client": "^6.19.0",
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/prisma/migrations/20261031150000_schedule_integrity_checks/migration.sql ./prisma/migrations/20261031150000_schedule_integrity_checks/migration.sql
+--- ../turnia-original/prisma/migrations/20261031150000_schedule_integrity_checks/migration.sql	1970-01-01 00:00:00.000000000 +0000
++++ ./prisma/migrations/20261031150000_schedule_integrity_checks/migration.sql	2026-10-31 20:49:51.713095853 +0000
+@@ -0,0 +1,43 @@
++-- Integridad de agenda (migración aditiva, sin cambios destructivos).
++--
++-- Convención: weekday 0 = domingo ... 6 = sábado; startMinute/endMinute son
++-- minutos desde las 00:00 en la zona horaria del negocio (endMinute exclusivo,
++-- máximo 1440).
++--
++-- Antes de aplicarla conviene comprobar que no existan filas que la violen
++-- (ver docs/etapa-1-agenda-segura.md). Si alguna fila existente incumple una
++-- regla, PostgreSQL aborta la migración completa y no queda nada a medias.
++
++ALTER TABLE "BusinessHours"
++ADD CONSTRAINT "business_hours_valid_window"
++CHECK (
++    "weekday" BETWEEN 0 AND 6
++    AND "startMinute" >= 0
++    AND "endMinute" <= 1440
++    AND "startMinute" < "endMinute"
++);
++
++ALTER TABLE "StaffAvailability"
++ADD CONSTRAINT "staff_availability_valid_window"
++CHECK (
++    "weekday" BETWEEN 0 AND 6
++    AND "startMinute" >= 0
++    AND "endMinute" <= 1440
++    AND "startMinute" < "endMinute"
++);
++
++ALTER TABLE "BusinessClosure"
++ADD CONSTRAINT "business_closure_valid_range"
++CHECK ("startsAt" < "endsAt");
++
++ALTER TABLE "TimeOff"
++ADD CONSTRAINT "time_off_valid_range"
++CHECK ("startsAt" < "endsAt");
++
++ALTER TABLE "Booking"
++ADD CONSTRAINT "booking_valid_range"
++CHECK ("startsAt" < "endsAt");
++
++ALTER TABLE "Service"
++ADD CONSTRAINT "service_valid_duration_and_price"
++CHECK ("durationMinutes" > 0 AND "price" >= 0);
+diff -ruN -x node_modules -x dist -x '*.tsbuildinfo' -x .env ../turnia-original/prisma/seed.ts ./prisma/seed.ts
+--- ../turnia-original/prisma/seed.ts	2026-10-31 20:41:48.708358700 +0000
++++ ./prisma/seed.ts	2026-10-31 20:49:51.729390617 +0000
+@@ -1,5 +1,10 @@
+-﻿import "../apps/api/node_modules/dotenv/config.js";
++﻿import { fileURLToPath } from "node:url";
++import dotenv from "../apps/api/node_modules/dotenv/lib/main.js";
+ import { PrismaClient } from "@prisma/client";
++import { hashPassword } from "../apps/api/src/auth.js";
++
++// Carga el .env de la raíz sin importar desde dónde se ejecute el seed.
++dotenv.config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
+ 
+ const prisma = new PrismaClient();
+ 
+@@ -65,6 +70,69 @@
+     },
+   });
+ 
++  // Horarios por defecto (lunes a sábado, 08:00-18:00) solo si el negocio y el
++  // empleado todavía no tienen ninguno. Weekday: 0 = domingo ... 6 = sábado.
++  const defaultWindows = [1, 2, 3, 4, 5, 6].map((weekday) => ({
++    weekday,
++    startMinute: 8 * 60,
++    endMinute: 18 * 60,
++  }));
++
++  const existingBusinessHours = await prisma.businessHours.count({
++    where: { businessId: business.id },
++  });
++  if (existingBusinessHours === 0) {
++    await prisma.businessHours.createMany({
++      data: defaultWindows.map((window) => ({
++        ...window,
++        businessId: business.id,
++      })),
++    });
++  }
++
++  const existingStaffAvailability = await prisma.staffAvailability.count({
++    where: { staffId: staff.id },
++  });
++  if (existingStaffAvailability === 0) {
++    await prisma.staffAvailability.createMany({
++      data: defaultWindows.map((window) => ({ ...window, staffId: staff.id })),
++    });
++  }
++
++  // Usuario propietario opcional: solo si se definen las tres variables en
++  // .env. La contraseña nunca se guarda en el código; se almacena con scrypt.
++  const ownerEmail = process.env.SEED_OWNER_EMAIL?.trim().toLowerCase();
++  const ownerPassword = process.env.SEED_OWNER_PASSWORD;
++  const ownerName = process.env.SEED_OWNER_NAME?.trim();
++
++  if (ownerEmail && ownerPassword && ownerName) {
++    const owner =
++      (await prisma.user.findUnique({
++        where: { emailNormalized: ownerEmail },
++      })) ??
++      (await prisma.user.create({
++        data: {
++          email: ownerEmail,
++          emailNormalized: ownerEmail,
++          passwordHash: await hashPassword(ownerPassword),
++          fullName: ownerName,
++        },
++      }));
++
++    await prisma.membership.upsert({
++      where: {
++        businessId_userId: { businessId: business.id, userId: owner.id },
++      },
++      update: {},
++      create: { businessId: business.id, userId: owner.id, role: "OWNER" },
++    });
++    console.log(`Propietario listo: ${owner.email}`);
++  } else {
++    console.log(
++      "Sin usuario propietario: define SEED_OWNER_EMAIL, SEED_OWNER_PASSWORD y SEED_OWNER_NAME en .env para crearlo.",
++    );
++  }
++
+   console.log("Datos de prueba listos:");
+   console.log(`Negocio: ${business.name} (${business.id})`);
+   console.log(`Servicio: ${service.name} (${service.id})`);

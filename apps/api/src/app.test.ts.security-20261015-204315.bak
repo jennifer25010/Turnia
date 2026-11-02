@@ -1,0 +1,310 @@
+import express from "express";
+import request from "supertest";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { prismaMock } = vi.hoisted(() => ({
+  prismaMock: {
+    $queryRaw: vi.fn(),
+    $transaction: vi.fn(),
+    booking: {
+      findMany: vi.fn(),
+      create: vi.fn(),
+    },
+    business: {
+      findFirst: vi.fn(),
+    },
+    service: {
+      findFirst: vi.fn(),
+    },
+    staff: {
+      findFirst: vi.fn(),
+    },
+    staffService: {
+      findUnique: vi.fn(),
+    },
+    customer: {
+      findFirst: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+    },
+  },
+}));
+
+vi.mock("./lib/prisma.js", () => ({
+  prisma: prismaMock,
+}));
+
+import { app, errorHandler } from "./app.js";
+
+describe("GET /api/v1/health", () => {
+  it("responde que la API está disponible", async () => {
+    const response = await request(app).get("/api/v1/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ status: "ok" });
+  });
+});
+
+describe("respuestas de error", () => {
+  it("responde JSON consistente para rutas inexistentes", async () => {
+    const response = await request(app).get("/api/v1/no-existe");
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({
+      error: { code: "NOT_FOUND", message: "Ruta no encontrada" },
+    });
+  });
+
+  it("responde JSON sin trazas para JSON malformado", async () => {
+    const response = await request(app)
+      .post("/api/v1/health")
+      .set("Content-Type", "application/json")
+      .send("{");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("BAD_REQUEST");
+    expect(JSON.stringify(response.body)).not.toContain("stack");
+  });
+
+  it("oculta detalles de errores internos en producción", async () => {
+    const productionApp = express();
+    productionApp.get("/failure", (_request, _response, next) => {
+      next(new Error("detalle interno confidencial"));
+    });
+    productionApp.use(errorHandler);
+
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+
+    try {
+      const response = await request(productionApp).get("/failure");
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({
+        error: {
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Error interno del servidor",
+        },
+      });
+      expect(JSON.stringify(response.body)).not.toContain("confidencial");
+    } finally {
+      if (previousNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = previousNodeEnv;
+      }
+    }
+  });
+});
+
+describe("POST /api/v1/bookings: validaciones", () => {
+  it("rechaza un cuerpo vacío sin consultar la base de datos", async () => {
+    const response = await request(app).post("/api/v1/bookings").send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("BAD_REQUEST");
+    expect(response.body.error.message).toContain("businessId");
+  });
+
+  it("rechaza identificadores que no son UUID válidos", async () => {
+    const response = await request(app).post("/api/v1/bookings").send({
+      businessId: "no-es-un-uuid",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      startsAt: "2026-10-25T10:00:00-05:00",
+      name: "Cliente de prueba",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("BAD_REQUEST");
+  });
+
+  it("rechaza un correo electrónico con formato inválido", async () => {
+    const response = await request(app).post("/api/v1/bookings").send({
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      startsAt: "2026-10-25T10:00:00-05:00",
+      name: "Cliente de prueba",
+      email: "correo-invalido",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("BAD_REQUEST");
+    expect(response.body.error.message).toContain("correo");
+  });
+});
+
+describe("GET /api/v1/bookings", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("lista las reservas filtradas por negocio", async () => {
+    const bookings = [
+      {
+        id: "booking-1",
+        status: "CONFIRMED",
+        source: "PANEL",
+        customerNameSnapshot: "Cliente de prueba",
+        customerEmailSnapshot: "cliente@example.com",
+        customerPhoneSnapshot: "3001234567",
+        serviceNameSnapshot: "Corte de cabello",
+        durationMinutesSnapshot: 30,
+        priceSnapshot: 25000,
+        startsAt: new Date("2026-10-25T15:00:00.000Z"),
+        endsAt: new Date("2026-10-25T15:30:00.000Z"),
+        notes: null,
+        createdAt: new Date("2026-10-20T12:00:00.000Z"),
+      },
+    ];
+
+    prismaMock.booking.findMany.mockResolvedValue(bookings);
+
+    const response = await request(app).get(
+      "/api/v1/bookings?businessId=758ad131-14b1-42e4-8d74-d093bb62c41b",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toHaveLength(1);
+    expect(response.body.data[0].id).toBe("booking-1");
+
+    expect(prismaMock.booking.findMany).toHaveBeenCalledWith({
+      where: {
+        businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      },
+      orderBy: {
+        startsAt: "asc",
+      },
+      select: expect.any(Object),
+    });
+  });
+
+  it("rechaza un businessId inválido", async () => {
+    const response = await request(app).get(
+      "/api/v1/bookings?businessId=no-es-un-uuid",
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("BAD_REQUEST");
+    expect(prismaMock.booking.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/v1/bookings: creación simulada", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    prismaMock.$transaction.mockImplementation(
+      async (callback: (tx: typeof prismaMock) => Promise<unknown>) =>
+        callback(prismaMock),
+    );
+
+    prismaMock.business.findFirst.mockResolvedValue({
+      id: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      bookingHoldMinutes: 1440,
+    });
+
+    prismaMock.service.findFirst.mockResolvedValue({
+      id: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      name: "Corte de cabello",
+      durationMinutes: 30,
+      price: 25000,
+      active: true,
+    });
+
+    prismaMock.staff.findFirst.mockResolvedValue({
+      id: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      displayName: "Empleado Demo",
+      active: true,
+    });
+
+    prismaMock.staffService.findUnique.mockResolvedValue({
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+    });
+
+    prismaMock.customer.findFirst.mockResolvedValue(null);
+
+    prismaMock.customer.create.mockResolvedValue({
+      id: "customer-simulado",
+      name: "Cliente de prueba",
+      email: "cliente@example.com",
+      phone: "3001234567",
+    });
+
+    prismaMock.booking.create.mockResolvedValue({
+      id: "booking-simulado",
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      customerId: "customer-simulado",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      status: "CONFIRMED",
+      customerNameSnapshot: "Cliente de prueba",
+      serviceNameSnapshot: "Corte de cabello",
+      durationMinutesSnapshot: 30,
+      priceSnapshot: 25000,
+      startsAt: new Date("2026-10-25T15:00:00.000Z"),
+      endsAt: new Date("2026-10-25T15:30:00.000Z"),
+      notes: null,
+      createdAt: new Date("2026-10-20T12:00:00.000Z"),
+    });
+  });
+
+  it("rechaza una reserva cuando existe un conflicto de horario", async () => {
+    prismaMock.$transaction.mockRejectedValue(
+      Object.assign(
+        new Error(
+          "conflict with constraint booking_staff_no_overlapping_active",
+        ),
+        { code: "23P01" },
+      ),
+    );
+
+    const response = await request(app).post("/api/v1/bookings").send({
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      startsAt: "2026-10-25T10:00:00-05:00",
+      name: "Cliente de prueba",
+      email: "cliente@example.com",
+      phone: "3001234567",
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe("BOOKING_CONFLICT");
+    expect(response.body.error.message).toContain("horario");
+  });
+
+  it("crea una reserva y calcula su hora de finalización", async () => {
+    const response = await request(app).post("/api/v1/bookings").send({
+      businessId: "758ad131-14b1-42e4-8d74-d093bb62c41b",
+      serviceId: "caa733de-3c1a-4679-b2ea-5d9a79e792cb",
+      staffId: "cd5e9781-0edf-45e0-9e4f-3a32aef9b681",
+      startsAt: "2026-10-25T10:00:00-05:00",
+      name: "Cliente de prueba",
+      email: "cliente@example.com",
+      phone: "3001234567",
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.id).toBe("booking-simulado");
+    expect(response.body.data.status).toBe("CONFIRMED");
+
+    expect(prismaMock.booking.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "CONFIRMED",
+          durationMinutesSnapshot: 30,
+          priceSnapshot: 25000,
+          startsAt: new Date("2026-10-25T15:00:00.000Z"),
+          endsAt: new Date("2026-10-25T15:30:00.000Z"),
+        }),
+      }),
+    );
+  });
+});

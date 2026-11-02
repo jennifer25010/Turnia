@@ -16,7 +16,8 @@
     "test": "pnpm --filter @turnia/api test",
     "typecheck": "pnpm -r typecheck",
     "prisma:validate": "prisma validate",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "db:seed": "pnpm --filter @turnia/api exec tsx ../../prisma/seed.ts"
   },
   "devDependencies": {
     "@prisma/client": "^6.19.0",

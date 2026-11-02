@@ -1,0 +1,23 @@
+/** Campos de una reserva que se devuelven al panel (listado y respuestas). */
+export const bookingSummarySelect = {
+  id: true,
+  status: true,
+  source: true,
+  version: true,
+  customerNameSnapshot: true,
+  customerEmailSnapshot: true,
+  customerPhoneSnapshot: true,
+  serviceId: true,
+  serviceNameSnapshot: true,
+  durationMinutesSnapshot: true,
+  priceSnapshot: true,
+  staffId: true,
+  staff: { select: { displayName: true } },
+  startsAt: true,
+  endsAt: true,
+  notes: true,
+  confirmedAt: true,
+  cancelledAt: true,
+  cancelReason: true,
+  createdAt: true,
+} as const;

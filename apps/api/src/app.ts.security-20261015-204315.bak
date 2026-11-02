@@ -1,0 +1,767 @@
+import express from "express";
+import type { ErrorRequestHandler } from "express";
+import { prisma } from "./lib/prisma.js";
+import {
+  createSessionToken,
+  hashPassword,
+  hashSessionToken,
+  verifyPassword,
+} from "./auth.js";
+
+export const app = express();
+
+app.disable("x-powered-by");
+app.use(express.json());
+
+// Patrón para validar UUID.
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Health check de la API.
+app.get("/api/v1/health", (_request, response) => {
+  response.status(200).json({
+    status: "ok",
+  });
+});
+
+// Health check de la conexión a PostgreSQL.
+app.get("/api/v1/health/db", async (_request, response) => {
+  await prisma.$queryRaw`SELECT 1`;
+
+  response.status(200).json({
+    status: "ok",
+    database: "connected",
+  });
+});
+
+// Middleware centralizado de errores.
+export const errorHandler: ErrorRequestHandler = (
+  error: unknown,
+  _request,
+  response,
+  _next,
+) => {
+  void _next;
+  const candidate =
+    typeof error === "object" && error !== null
+      ? (error as {
+          status?: unknown;
+          statusCode?: unknown;
+          message?: unknown;
+        })
+      : {};
+
+  const suppliedStatus = candidate.status ?? candidate.statusCode;
+
+  const status =
+    typeof suppliedStatus === "number" &&
+    Number.isInteger(suppliedStatus) &&
+    suppliedStatus >= 400 &&
+    suppliedStatus <= 599
+      ? suppliedStatus
+      : 500;
+
+  const message =
+    status >= 500 && process.env.NODE_ENV === "production"
+      ? "Error interno del servidor"
+      : typeof candidate.message === "string"
+        ? candidate.message
+        : "Error interno del servidor";
+
+  response.status(status).json({
+    error: {
+      code: status >= 500 ? "INTERNAL_SERVER_ERROR" : "BAD_REQUEST",
+      message,
+    },
+  });
+};
+
+const SESSION_COOKIE = "turnia_session";
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function readSessionCookie(cookieHeader: string | undefined): string | null {
+  if (!cookieHeader) return null;
+
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+
+    if (name === SESSION_COOKIE && /^[A-Za-z0-9_-]{43}$/.test(value)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function sessionCookie(token: string, maxAgeSeconds: number): string {
+  const parts = [
+    `${SESSION_COOKIE}=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+
+  if (process.env.NODE_ENV === "production") {
+    parts.push("Secure");
+  }
+
+  return parts.join("; ");
+}
+
+function clearedSessionCookie(): string {
+  const parts = [
+    `${SESSION_COOKIE}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ];
+
+  if (process.env.NODE_ENV === "production") {
+    parts.push("Secure");
+  }
+
+  return parts.join("; ");
+}
+
+app.post("/api/v1/auth/login", async (request, response) => {
+  const body: unknown = request.body;
+
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("email" in body) ||
+    !("password" in body) ||
+    typeof body.email !== "string" ||
+    typeof body.password !== "string" ||
+    body.email.trim().length > 254 ||
+    body.password.length === 0 ||
+    body.password.length > 1024
+  ) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "Debes proporcionar un correo y una contraseña válidos.",
+      },
+    });
+    return;
+  }
+
+  const emailNormalized = body.email.trim().toLowerCase();
+
+  const user = await prisma.user.findUnique({
+    where: { emailNormalized },
+    select: {
+      id: true,
+      email: true,
+      fullName: true,
+      passwordHash: true,
+      active: true,
+    },
+  });
+
+  const passwordValid = user
+    ? await verifyPassword(body.password, user.passwordHash)
+    : false;
+
+  if (!user || !user.active || !passwordValid) {
+    response.status(401).json({
+      error: {
+        code: "INVALID_CREDENTIALS",
+        message: "Correo o contraseña incorrectos.",
+      },
+    });
+    return;
+  }
+
+  const token = createSessionToken();
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
+
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashSessionToken(token),
+      expiresAt,
+    },
+  });
+
+  response.setHeader(
+    "Set-Cookie",
+    sessionCookie(token, SESSION_DURATION_MS / 1000),
+  );
+
+  response.status(200).json({
+    data: {
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+      },
+      expiresAt: expiresAt.toISOString(),
+    },
+  });
+});
+
+app.get("/api/v1/auth/me", async (request, response) => {
+  const token = readSessionCookie(request.headers.cookie);
+
+  if (!token) {
+    response.status(401).json({
+      error: {
+        code: "UNAUTHENTICATED",
+        message: "Debes iniciar sesión.",
+      },
+    });
+    return;
+  }
+
+  const session = await prisma.session.findFirst({
+    where: {
+      tokenHash: hashSessionToken(token),
+      revokedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    select: {
+      expiresAt: true,
+      user: {
+        select: {
+          id: true,
+          email: true,
+          fullName: true,
+          active: true,
+        },
+      },
+    },
+  });
+
+  if (!session || !session.user.active) {
+    response.status(401).json({
+      error: {
+        code: "UNAUTHENTICATED",
+        message: "La sesión no es válida o ha expirado.",
+      },
+    });
+    return;
+  }
+
+  response.status(200).json({
+    data: {
+      user: {
+        id: session.user.id,
+        email: session.user.email,
+        fullName: session.user.fullName,
+      },
+      expiresAt: session.expiresAt.toISOString(),
+    },
+  });
+});
+
+app.post("/api/v1/auth/logout", async (request, response) => {
+  const token = readSessionCookie(request.headers.cookie);
+
+  if (token) {
+    await prisma.session.updateMany({
+      where: {
+        tokenHash: hashSessionToken(token),
+        revokedAt: null,
+      },
+      data: {
+        revokedAt: new Date(),
+      },
+    });
+  }
+
+  response.setHeader("Set-Cookie", clearedSessionCookie());
+  response.status(200).json({ data: { loggedOut: true } });
+});
+/**
+ * Lista las reservas de un negocio.
+ * Temporalmente usa businessId mientras se implementa autenticación.
+ */
+app.get("/api/v1/bookings", async (request, response) => {
+  const businessId = request.query.businessId;
+
+  if (typeof businessId !== "string" || !uuidPattern.test(businessId)) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "Debes proporcionar un businessId válido",
+      },
+    });
+    return;
+  }
+
+  const bookings = await prisma.booking.findMany({
+    where: { businessId },
+    orderBy: { startsAt: "asc" },
+    select: {
+      id: true,
+      status: true,
+      source: true,
+      customerNameSnapshot: true,
+      customerEmailSnapshot: true,
+      customerPhoneSnapshot: true,
+      serviceNameSnapshot: true,
+      durationMinutesSnapshot: true,
+      priceSnapshot: true,
+      startsAt: true,
+      endsAt: true,
+      notes: true,
+      createdAt: true,
+    },
+  });
+
+  response.status(200).json({
+    data: bookings,
+  });
+});
+
+/**
+ * Catálogo de un negocio: servicios activos y empleados
+ * activos con los servicios que tienen asignados.
+ * Temporalmente usa businessId mientras se implementa
+ * la autenticación.
+ */
+app.get("/api/v1/catalog", async (request, response) => {
+  const businessId = request.query.businessId;
+
+  if (typeof businessId !== "string" || !uuidPattern.test(businessId)) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "Debes proporcionar un businessId válido",
+      },
+    });
+    return;
+  }
+
+  const business = await prisma.business.findFirst({
+    where: {
+      id: businessId,
+      active: true,
+    },
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+      timezone: true,
+      currency: true,
+      services: {
+        where: { active: true },
+        orderBy: { name: "asc" },
+        select: {
+          id: true,
+          name: true,
+          description: true,
+          durationMinutes: true,
+          price: true,
+          staffServices: {
+            select: {
+              staff: {
+                select: {
+                  id: true,
+                  displayName: true,
+                },
+              },
+            },
+          },
+        },
+      },
+      staff: {
+        where: { active: true },
+        orderBy: { displayName: "asc" },
+        select: {
+          id: true,
+          displayName: true,
+          staffServices: {
+            select: {
+              serviceId: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!business) {
+    response.status(404).json({
+      error: {
+        code: "BUSINESS_NOT_FOUND",
+        message: "El negocio no existe o está inactivo",
+      },
+    });
+    return;
+  }
+
+  response.status(200).json({
+    data: {
+      id: business.id,
+      name: business.name,
+      slug: business.slug,
+      timezone: business.timezone,
+      currency: business.currency,
+      services: business.services.map((service) => ({
+        id: service.id,
+        name: service.name,
+        description: service.description,
+        durationMinutes: service.durationMinutes,
+        price: service.price,
+        staff: service.staffServices.map((assignment) => assignment.staff),
+      })),
+      staff: business.staff.map((member) => ({
+        id: member.id,
+        displayName: member.displayName,
+        serviceIds: member.staffServices.map(
+          (assignment) => assignment.serviceId,
+        ),
+      })),
+    },
+  });
+});
+
+// Crear una reserva.
+app.post("/api/v1/bookings", async (request, response) => {
+  const body: unknown = request.body;
+
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "El cuerpo debe ser un objeto JSON",
+      },
+    });
+    return;
+  }
+
+  const input = body as Record<string, unknown>;
+
+  const {
+    businessId,
+    serviceId,
+    staffId,
+    startsAt,
+    name,
+    email,
+    phone,
+    notes,
+  } = input;
+
+  // Validar los campos obligatorios.
+  if (
+    typeof businessId !== "string" ||
+    !uuidPattern.test(businessId) ||
+    typeof serviceId !== "string" ||
+    !uuidPattern.test(serviceId) ||
+    typeof staffId !== "string" ||
+    !uuidPattern.test(staffId) ||
+    typeof startsAt !== "string" ||
+    typeof name !== "string" ||
+    !name.trim() ||
+    name.trim().length > 150
+  ) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "Revisa businessId, serviceId, staffId, startsAt y name",
+      },
+    });
+    return;
+  }
+
+  // Validar los campos opcionales.
+  if (
+    (email !== undefined &&
+      (typeof email !== "string" || email.length > 254)) ||
+    (phone !== undefined && (typeof phone !== "string" || phone.length > 40)) ||
+    (notes !== undefined && (typeof notes !== "string" || notes.length > 2000))
+  ) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "email, phone o notes tienen un formato inválido",
+      },
+    });
+    return;
+  }
+
+  // Normalizar y validar el correo electrónico.
+  const normalizedEmail =
+    typeof email === "string" && email.trim()
+      ? email.trim().toLowerCase()
+      : null;
+
+  if (
+    normalizedEmail !== null &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
+  ) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "El correo electrónico no tiene un formato válido",
+      },
+    });
+    return;
+  }
+
+  // Validar fecha y hora ISO.
+  const start = new Date(startsAt);
+
+  if (
+    !Number.isFinite(start.getTime()) ||
+    !/^\d{4}-\d{2}-\d{2}T/.test(startsAt)
+  ) {
+    response.status(400).json({
+      error: {
+        code: "BAD_REQUEST",
+        message: "startsAt debe ser una fecha ISO válida con hora",
+      },
+    });
+    return;
+  }
+
+  const normalizedPhone =
+    typeof phone === "string" && phone.trim() ? phone.trim() : null;
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      // Verificar que el negocio exista y esté activo.
+      const business = await tx.business.findFirst({
+        where: {
+          id: businessId,
+          active: true,
+        },
+        select: {
+          id: true,
+          bookingHoldMinutes: true,
+        },
+      });
+
+      // Verificar que el servicio pertenezca al negocio.
+      const service = await tx.service.findFirst({
+        where: {
+          id: serviceId,
+          businessId,
+          active: true,
+        },
+      });
+
+      // Verificar que el empleado pertenezca al negocio.
+      const staff = await tx.staff.findFirst({
+        where: {
+          id: staffId,
+          businessId,
+          active: true,
+        },
+      });
+
+      if (!business || !service || !staff) {
+        return { kind: "invalid" as const };
+      }
+
+      // Verificar que el empleado pueda realizar el servicio.
+      const assignment = await tx.staffService.findUnique({
+        where: {
+          staffId_serviceId: {
+            staffId,
+            serviceId,
+          },
+        },
+      });
+
+      if (!assignment || assignment.businessId !== businessId) {
+        return { kind: "invalid" as const };
+      }
+
+      // Calcular la hora de finalización.
+      const end = new Date(start.getTime() + service.durationMinutes * 60_000);
+
+      // Buscar al cliente por correo o teléfono dentro del negocio.
+      let customer = null;
+
+      if (normalizedEmail) {
+        customer = await tx.customer.findFirst({
+          where: {
+            businessId,
+            email: {
+              equals: normalizedEmail,
+              mode: "insensitive",
+            },
+          },
+        });
+      }
+
+      if (!customer && normalizedPhone) {
+        customer = await tx.customer.findFirst({
+          where: {
+            businessId,
+            phone: normalizedPhone,
+          },
+        });
+      }
+
+      // Crear o actualizar los datos del cliente.
+      if (!customer) {
+        customer = await tx.customer.create({
+          data: {
+            businessId,
+            name: name.trim(),
+            email: normalizedEmail,
+            phone: normalizedPhone,
+          },
+        });
+      } else {
+        customer = await tx.customer.update({
+          where: {
+            id: customer.id,
+          },
+          data: {
+            name: name.trim(),
+            ...(normalizedEmail ? { email: normalizedEmail } : {}),
+            ...(normalizedPhone ? { phone: normalizedPhone } : {}),
+          },
+        });
+      }
+
+      // Crear la reserva.
+      const booking = await tx.booking.create({
+        data: {
+          businessId,
+          customerId: customer.id,
+          serviceId,
+          staffId,
+          source: "PANEL",
+          status: "CONFIRMED",
+
+          customerNameSnapshot: customer.name,
+          customerEmailSnapshot: customer.email,
+          customerPhoneSnapshot: customer.phone,
+
+          serviceNameSnapshot: service.name,
+          durationMinutesSnapshot: service.durationMinutes,
+          priceSnapshot: service.price,
+
+          startsAt: start,
+          endsAt: end,
+
+          notes:
+            typeof notes === "string" && notes.trim() ? notes.trim() : null,
+
+          confirmedAt: new Date(),
+          holdExpiresAt: null,
+        },
+        select: {
+          id: true,
+          businessId: true,
+          customerId: true,
+          serviceId: true,
+          staffId: true,
+          status: true,
+          customerNameSnapshot: true,
+          serviceNameSnapshot: true,
+          durationMinutesSnapshot: true,
+          priceSnapshot: true,
+          startsAt: true,
+          endsAt: true,
+          notes: true,
+          createdAt: true,
+        },
+      });
+
+      return {
+        kind: "created" as const,
+        booking,
+      };
+    });
+
+    // Referencias inválidas.
+    if (result.kind === "invalid") {
+      response.status(400).json({
+        error: {
+          code: "INVALID_BOOKING_REFERENCE",
+          message:
+            "El negocio, servicio o empleado no existe, está inactivo o no corresponde al servicio",
+        },
+      });
+      return;
+    }
+
+    // Reserva creada correctamente.
+    response.status(201).json({
+      data: result.booking,
+    });
+  } catch (error: unknown) {
+    // Examinar el mensaje y los datos del error de Prisma.
+    const candidate =
+      typeof error === "object" && error !== null
+        ? (error as {
+            code?: unknown;
+            message?: unknown;
+            meta?: unknown;
+            cause?: unknown;
+            stack?: unknown;
+          })
+        : {};
+
+    const errorParts: string[] = [];
+
+    if (error instanceof Error) {
+      errorParts.push(error.message);
+      errorParts.push(error.stack ?? "");
+    }
+
+    for (const value of [
+      candidate.code,
+      candidate.message,
+      candidate.meta,
+      candidate.cause,
+      candidate.stack,
+    ]) {
+      if (typeof value === "string") {
+        errorParts.push(value);
+      } else if (typeof value === "object" && value !== null) {
+        try {
+          errorParts.push(JSON.stringify(value));
+        } catch {
+          // Ignorar valores que no se puedan serializar.
+        }
+      }
+    }
+
+    const errorText = errorParts.join(" ");
+
+    // Detectar conflictos de horario reportados por PostgreSQL.
+    if (
+      errorText.includes("23P01") ||
+      errorText.includes("booking_staff_no_overlapping_active")
+    ) {
+      response.status(409).json({
+        error: {
+          code: "BOOKING_CONFLICT",
+          message: "El empleado ya tiene una reserva en ese horario.",
+        },
+      });
+      return;
+    }
+
+    // Los demás errores pasan al middleware centralizado.
+    throw error;
+  }
+});
+
+// Ruta 404 para endpoints inexistentes.
+app.use((_request, response) => {
+  response.status(404).json({
+    error: {
+      code: "NOT_FOUND",
+      message: "Ruta no encontrada",
+    },
+  });
+});
+
+// Middleware de errores al final de las rutas.
+app.use(errorHandler);

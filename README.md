@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Turnia
 
 Fundación técnica de Turnia: monorepo con React, Vite y TypeScript en el frontend; Express y TypeScript en la API; PostgreSQL, Prisma, Tailwind CSS y Vitest.
@@ -45,7 +44,11 @@ Resultados de la revisión correctiva, incluidas pruebas, builds, Prisma y limit
 
 ## Prisma
 
-El esquema PostgreSQL inicial está en `prisma/schema.prisma` y no contiene modelos de negocio. Tras crear `.env`, ejecuta `pnpm prisma:validate` para validar el esquema y `pnpm prisma:generate` para generar Prisma Client. Validar o generar no requiere que PostgreSQL esté levantado; conectar la aplicación sí.
+El esquema PostgreSQL está en `prisma/schema.prisma` y las migraciones en `prisma/migrations`. Tras crear `.env`, ejecuta `pnpm prisma:validate` para validar el esquema y `pnpm prisma:generate` para generar Prisma Client. Validar o generar no requiere que PostgreSQL esté levantado; conectar la aplicación sí.
+
+Las restricciones de integridad de la agenda (exclusión de reservas solapadas por empleado y comprobaciones de rangos) viven en migraciones SQL; consulta [docs/etapa-1-agenda-segura.md](docs/etapa-1-agenda-segura.md).
+
+Datos de demostración (negocio, servicio, empleado y horarios por defecto): `pnpm db:seed`. Para crear además un usuario propietario, define `SEED_OWNER_EMAIL`, `SEED_OWNER_PASSWORD` (mínimo 12 caracteres) y `SEED_OWNER_NAME` en `.env` antes de ejecutarlo.
 
 ## Verificar en Windows
 
@@ -69,6 +72,4 @@ Si `docker version` no conecta con el daemon, inicia Docker Desktop. Si `docker 
 
 - [Arquitectura](docs/architecture.md)
 - [Plan de implementación](docs/implementation-plan.md)
-=======
-# turnia
->>>>>>> ceb93a00758fde93f2d81949dc98baa013b7559b
+- [Etapa 1: agenda segura y acceso](docs/etapa-1-agenda-segura.md)
