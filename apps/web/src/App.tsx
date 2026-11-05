@@ -16,7 +16,6 @@ import {
   ChevronDown,
   Clock3,
   ClipboardList,
-  HeartHandshake,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -477,6 +476,9 @@ export default function App({
 
   const today = dataSource === "api" ? getTodayInBogota() : "2026-10-14";
   const todayAppointments = appointments.filter((item) => item.date === today);
+  const upcomingAppointments = appointments
+    .filter((item) => item.date >= today)
+    .slice(0, 4);
   const confirmed = appointments.filter(
     (item) => item.status === "Confirmada",
   ).length;
@@ -635,9 +637,13 @@ export default function App({
       )}
       <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
         <div className="brand">
-          <div className="brand-mark">
-            <HeartHandshake size={25} />
-          </div>
+          <img
+            className="brand-logo"
+            src="/brand/logo-mark.png"
+            alt=""
+            width={46}
+            height={40}
+          />
           <div>
             <strong>turnia</strong>
             <span>GESTIÓN DE CITAS</span>
@@ -931,11 +937,32 @@ export default function App({
                       Ver todas <ArrowRight size={15} />
                     </button>
                   </div>
-                  <div className="appointment-list">
-                    {appointments
-                      .filter((item) => item.date >= today)
-                      .slice(0, 4)
-                      .map((item) => (
+                  <div
+                    className="appointment-list"
+                    aria-busy={isLoadingBookings}
+                  >
+                    {isLoadingBookings &&
+                      [0, 1, 2].map((n) => (
+                        <div
+                          className="skeleton-row"
+                          key={n}
+                          aria-hidden="true"
+                        >
+                          <span className="skeleton" />
+                          <span className="skeleton" />
+                          <span className="skeleton" />
+                        </div>
+                      ))}
+                    {!isLoadingBookings &&
+                      upcomingAppointments.length === 0 && (
+                        <div className="empty-state">
+                          {bookingLoadError
+                            ? "No se pudieron cargar las citas."
+                            : "No hay próximas citas por ahora."}
+                        </div>
+                      )}
+                    {!isLoadingBookings &&
+                      upcomingAppointments.map((item) => (
                         <div className="appointment-row" key={item.id}>
                           <div className="appointment-date">
                             <strong>{item.date.slice(8, 10)}</strong>
@@ -1271,18 +1298,19 @@ export default function App({
                   <div>
                     <h3>Identidad visual de Turnia</h3>
                     <p>
-                      Una paleta cálida, accesible y coherente con la
-                      experiencia de la fundación.
+                      Una paleta luminosa de naranjas, amarillos y azules cielo,
+                      pensada para leerse bien y sentirse cercana.
                     </p>
                   </div>
                 </div>
                 <div className="palette-grid">
                   {[
-                    ["#FFE8D6", "Crema"],
-                    ["#FFB79A", "Salmón suave"],
-                    ["#FF8360", "Coral"],
-                    ["#E8543F", "Terracota"],
-                    ["#9C2B1B", "Rojo profundo"],
+                    ["#FA9058", "Sè Lèi Orange"],
+                    ["#FECC64", "Quing Yellow"],
+                    ["#FCEABC", "Sun Drenched"],
+                    ["#FFF6E8", "Apricot Ice"],
+                    ["#B5D8FF", "Azure Sky"],
+                    ["#95CAFC", "Apocyan"],
                   ].map(([hex, name]) => (
                     <div className="palette-item" key={hex}>
                       <div
